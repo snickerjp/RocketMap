@@ -10,44 +10,32 @@ You can install the required packages on Ubuntu by running the following command
 
 .. code-block:: bash
 
-  sudo apt-get install -y python python-pip python-dev build-essential git
+  sudo apt-get install -y python python-pip python-dev build-essential git libssl-dev libffi-dev
   curl -sL https://deb.nodesource.com/setup_6.x | sudo -E bash -
   sudo apt-get install -y nodejs
 
 
-Debian 7/8
-**********
+Debian 7/8/9
+************
 
-Debian's sources lists are out of date and will not fetch the correct versions of Python and PIP. You must download and install these from source:
+Debian's sources lists are out of date and will not fetch the correct versions of NodeJS and NPM. You must download and install these from the Node repository:
 
 .. code-block:: bash
 
-	sudo apt-get install -y build-essential libbz2-dev libsqlite3-dev libreadline-dev zlib1g-dev libncurses5-dev libssl-dev libgdbm-dev python-dev nodejs npm
-	wget https://www.python.org/ftp/python/2.7.12/Python-2.7.12.tgz
-	tar xzf Python-2.7.12.tgz && cd Python-2.7.12
-	./configure --prefix=/opt/python
-	make
-	sudo make install
-	ln -s /opt/python/bin/python2.7 /usr/local/bin/python2.7
-	ln -s /opt/python/bin/python2.7 /usr/bin/python2.7
-	ln -s /usr/bin/python2.7 /usr/bin/python
-	ln -s /usr/local/bin/python2.7 /usr/local/bin/python
-	ln -s /opt/python/bin/pip /usr/bin/pip
-	ln -s /opt/python/bin/pip /usr/local/bin/pip
-	ln -s /usr/bin/nodejs /usr/bin/node
-	sed -e '$a\PATH="$PATH:/opt/python/bin"\' ~/.profile
-	source ~/.profile
-	wget https://bootstrap.pypa.io/get-pip.py
-	python get-pip.py
+    curl -sL https://raw.githubusercontent.com/nodesource/distributions/master/deb/setup_8.x | sudo -E bash -
+
+    sudo apt-get install -y build-essential libbz2-dev libreadline-dev libssl-dev libffi-dev zlib1g-dev libncurses5-dev libssl-dev libgdbm-dev python python-dev nodejs
+
+    curl -sL https://bootstrap.pypa.io/get-pip.py | sudo python -
 
 After install, check that you have the correct versions in your environment variables:
 
 .. code-block:: bash
 
 	~$ python --version
-		Python 2.7.12
+		Python 2.7.13
 	~$ pip --version
-		pip 8.1.2 from /home/user/.local/lib/python2.7/site-packages (python 2.7)
+		pip 9.0.1 from /usr/local/lib/python2.7/dist-packages (python 2.7)
 
 If your output looks as above, you can proceed with installation:
 
@@ -55,7 +43,7 @@ If your output looks as above, you can proceed with installation:
 
 	cd ~/
 	sudo apt-get install git
-	git clone https://github.com/RocketMap/RocketMap.git
+	git clone --recursive https://github.com/RocketMap/RocketMap.git
 	cd RocketMap
 	sudo -H pip install -r requirements.txt
 	npm install

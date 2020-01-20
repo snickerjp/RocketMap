@@ -24,8 +24,11 @@ import sys
 import traceback
 import random
 import time
-import copy
 import requests
+import schedulers
+import terminalsize
+import timeit
+import threading
 
 from datetime import datetime
 from threading import Thread, Lock
@@ -34,30 +37,24 @@ from sets import Set
 from collections import deque
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
+from distutils.version import StrictVersion
+from cachetools import TTLCache
 
-from pgoapi import PGoApi
-from pgoapi.utilities import f2i
-from pgoapi import utilities as util
 from pgoapi.hash_server import HashServer
-
-from .models import parse_map, GymDetails, parse_gyms, MainWorker, WorkerStatus
-from .fakePogoApi import FakePogoApi
-from .utils import now, generate_device_info
-from .transform import get_new_coords, jitter_location
-from .account import check_login, get_tutorial_state, complete_tutorial
+from .models import (parse_map, GymDetails, parse_gyms, MainWorker,
+                     WorkerStatus, HashKeys, ScannedLocation)
+from .utils import now, distance
+from .transform import get_new_coords
+from .account import setup_api, check_login, AccountSet
 from .captcha import captcha_overseer_thread, handle_captcha
-
 from .proxy import get_new_proxy
-
-import schedulers
-import terminalsize
+from .apiRequests import gym_get_info, get_map_objects as gmo
+from .transform import jitter_location
 
 log = logging.getLogger(__name__)
 
-TIMESTAMP = ('\000\000\000\000\000\000\000\000\000\000\000' +
-             '\000\000\000\000\000\000\000\000\000\000')
-
 loginDelayLock = Lock()
+gym_cache_lock = threading.Lock()
 
 
 # Thread to handle user input.
@@ -99,9 +96,8 @@ def switch_status_printer(display_type, current_page, mainlog,
 
 
 # Thread to print out the status of each worker.
-def status_printer(threadStatus, search_items_queue_array, db_updates_queue,
-                   wh_queue, account_queue, account_failures, account_captchas,
-                   logmode, hash_key, key_scheduler):
+def status_printer(threadStatus, account_failures, logmode, hash_key,
+                   key_scheduler):
 
     if (logmode == 'logs'):
         display_type = ['logs']
@@ -142,20 +138,6 @@ def status_printer(threadStatus, search_items_queue_array, db_updates_queue,
             # divide by zero.
             if usable_height < 1:
                 usable_height = 1
-
-            # Print the queue length.
-            search_items_queue_size = 0
-            for i in range(0, len(search_items_queue_array)):
-                search_items_queue_size += search_items_queue_array[i].qsize()
-
-            skip_total = threadStatus['Overseer']['skip_total']
-            status_text.append((
-                'Queues: {} search items, {} db updates, {} webhook.  ' +
-                'Total skipped items: {}. Spare accounts available: {}. ' +
-                'Accounts on hold: {}. Accounts with captcha: {}').format(
-                    search_items_queue_size, db_updates_queue.qsize(),
-                    wh_queue.qsize(), skip_total, account_queue.qsize(),
-                    len(account_failures), len(account_captchas)))
 
             # Print status of overseer.
             status_text.append('{} Overseer: {}'.format(
@@ -331,7 +313,14 @@ def worker_status_db_thread(threads_status, name, db_updates_queue):
                     'last_modified': datetime.utcnow(),
                     'accounts_working': status['active_accounts'],
                     'accounts_captcha': status['accounts_captcha'],
-                    'accounts_failed': status['accounts_failed']
+                    'accounts_failed': status['accounts_failed'],
+                    'success': status['success_total'],
+                    'fail': status['fail_total'],
+                    'empty': status['empty_total'],
+                    'skip': status['skip_total'],
+                    'captcha': status['captcha_total'],
+                    'start': status['starttime'],
+                    'elapsed': status['elapsed']
                 }
             elif status['type'] == 'Worker':
                 workers[status['username']] = WorkerStatus.db_format(
@@ -343,7 +332,7 @@ def worker_status_db_thread(threads_status, name, db_updates_queue):
 
 
 # The main search loop that keeps an eye on the over all process.
-def search_overseer_thread(args, new_location_queue, pause_bit, heartb,
+def search_overseer_thread(args, new_location_queue, control_flags, heartb,
                            db_updates_queue, wh_queue):
 
     log.info('Search overseer starting...')
@@ -351,10 +340,16 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb,
     search_items_queue_array = []
     scheduler_array = []
     account_queue = Queue()
+    account_sets = AccountSet(args.hlvl_kph)
     threadStatus = {}
     key_scheduler = None
-    api_version = '0.57.2'
     api_check_time = 0
+    hashkeys_last_upsert = timeit.default_timer()
+    hashkeys_upsert_min_delay = 5.0
+    gym_cache = None
+
+    if args.gym_info:
+        gym_cache = TTLCache(maxsize=10000, ttl=60)
 
     '''
     Create a queue of accounts for workers to pull from. When a worker has
@@ -365,6 +360,15 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb,
     '''
     for i, account in enumerate(args.accounts):
         account_queue.put(account)
+
+    '''
+    Create sets of special case accounts.
+    Currently limited to L30+ IV/CP scanning.
+    '''
+    account_sets.create_set('30', args.accounts_L30)
+
+    # Debug.
+    log.info('Added %s accounts to the L30 pool.', len(args.accounts_L30))
 
     # Create a list for failed accounts.
     account_failures = []
@@ -378,11 +382,13 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb,
         'accounts_captcha': 0,
         'accounts_failed': 0,
         'active_accounts': 0,
+        'busy_accounts': 0,
         'skip_total': 0,
         'captcha_total': 0,
         'success_total': 0,
         'fail_total': 0,
         'empty_total': 0,
+        'elapsed': 0,
         'scheduler': args.scheduler,
         'scheduler_status': {'tth_found': 0}
     }
@@ -390,17 +396,16 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb,
     # Create the key scheduler.
     if args.hash_key:
         log.info('Enabling hashing key scheduler...')
-        key_scheduler = schedulers.KeyScheduler(args.hash_key)
+        key_scheduler = schedulers.KeyScheduler(args.hash_key,
+                                                db_updates_queue)
 
-    if(args.print_status):
+    if (args.print_status):
         log.info('Starting status printer thread...')
-        t = Thread(target=status_printer,
-                   name='status_printer',
-                   args=(threadStatus, search_items_queue_array,
-                         db_updates_queue, wh_queue, account_queue,
-                         account_failures, account_captchas,
-                         args.print_status, args.hash_key,
-                         key_scheduler))
+        t = Thread(
+            target=status_printer,
+            name='status_printer',
+            args=(threadStatus, account_failures, args.print_status,
+                  args.hash_key, key_scheduler))
         t.daemon = True
         t.start()
 
@@ -430,6 +435,7 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb,
 
     # Create specified number of search_worker_thread.
     log.info('Starting search worker threads...')
+    log.info('Configured scheduler is %s.', args.scheduler)
     for i in range(0, args.workers):
         log.debug('Starting search worker thread %d...', i)
 
@@ -460,13 +466,14 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb,
             'proxy_display': proxy_display,
             'proxy_url': proxy_url,
         }
+        argset = (
+            args, account_queue, account_sets, account_failures,
+            account_captchas, control_flags, threadStatus[workerId],
+            db_updates_queue, wh_queue, scheduler, key_scheduler, gym_cache)
 
         t = Thread(target=search_worker_thread,
                    name='search-worker-{}'.format(i),
-                   args=(args, account_queue, account_failures,
-                         account_captchas, search_items_queue, pause_bit,
-                         threadStatus[workerId], db_updates_queue,
-                         wh_queue, scheduler, key_scheduler))
+                   args=argset)
         t.daemon = True
         t.start()
 
@@ -482,18 +489,28 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb,
 
     stats_timer = 0
 
-    # The real work starts here but will halt on pause_bit.set().
+    # The real work starts here but will halt when any control flag is set.
     while True:
+        if (args.hash_key is not None and
+            (hashkeys_last_upsert + hashkeys_upsert_min_delay) <=
+                timeit.default_timer()):
+            upsertKeys(args.hash_key, key_scheduler, db_updates_queue)
+            hashkeys_last_upsert = timeit.default_timer()
 
-        if (args.on_demand_timeout > 0 and
-                (now() - args.on_demand_timeout) > heartb[0]):
-            pause_bit.set()
+        odt_triggered = (args.on_demand_timeout > 0 and
+                         (now() - args.on_demand_timeout) > heartb[0])
+        if odt_triggered:
+            control_flags['on_demand'].set()
             log.info('Searching paused due to inactivity...')
 
         # Wait here while scanning is paused.
-        while pause_bit.is_set():
+        while is_paused(control_flags):
             for i in range(0, len(scheduler_array)):
                 scheduler_array[i].scanning_paused()
+            # API Watchdog - Continue to check API version.
+            if not args.no_version_check and not odt_triggered:
+                api_check_time = check_forced_version(
+                    args, api_check_time, control_flags['api_watchdog'])
             time.sleep(1)
 
         # If a new location has been passed to us, get the most recent one.
@@ -537,16 +554,25 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb,
                     i].get_overseer_message()
 
         # Let's update the total stats and add that info to message
-        update_total_stats(threadStatus, last_account_status)
+        # Added exception handler as dict items change
+        try:
+            update_total_stats(threadStatus, last_account_status)
+        except Exception as e:
+            log.error(
+                'Update total stats had an Exception: {}.'.format(
+                    repr(e)))
+            traceback.print_exc(file=sys.stdout)
+            time.sleep(10)
         threadStatus['Overseer']['message'] += '\n' + get_stats_message(
-            threadStatus)
+            threadStatus, search_items_queue_array, db_updates_queue, wh_queue,
+            account_queue, account_failures, account_captchas)
 
         # If enabled, display statistics information into logs on a
         # periodic basis.
         if args.stats_log_timer:
             stats_timer += 1
             if stats_timer == args.stats_log_timer:
-                log.info(get_stats_message(threadStatus))
+                log.info(threadStatus['Overseer']['message'])
                 stats_timer = 0
 
         # Update Overseer statistics
@@ -554,14 +580,14 @@ def search_overseer_thread(args, new_location_queue, pause_bit, heartb,
         threadStatus['Overseer']['accounts_captcha'] = len(account_captchas)
 
         # Send webhook updates when scheduler status changes.
-        if args.webhook_scheduler_updates:
+        if args.speed_scan and 'tth' in args.wh_types:
             wh_status_update(args, threadStatus['Overseer'], wh_queue,
                              scheduler_array[0])
 
         # API Watchdog - Check if Niantic forces a new API.
-        if not args.no_version_check:
-            api_check_time = check_forced_version(args, api_version,
-                                                  api_check_time, pause_bit)
+        if not args.no_version_check and not odt_triggered:
+            api_check_time = check_forced_version(
+                args, api_check_time, control_flags['api_watchdog'])
 
         # Now we just give a little pause here.
         time.sleep(1)
@@ -581,20 +607,21 @@ def get_scheduler_tth_found_pct(scheduler):
 def wh_status_update(args, status, wh_queue, scheduler):
     scheduler_name = status['scheduler']
 
-    if args.speed_scan:
-        tth_found = get_scheduler_tth_found_pct(scheduler)
-        spawns_found = getattr(scheduler, 'spawns_found', 0)
+    tth_found = get_scheduler_tth_found_pct(scheduler)
+    spawns_found = getattr(scheduler, 'spawns_found', 0)
 
-        if (tth_found - status['scheduler_status']['tth_found']) > 0.01:
-            log.debug('Scheduler update is due, sending webhook message.')
-            wh_queue.put(('scheduler', {'name': scheduler_name,
-                                        'instance': args.status_name,
-                                        'tth_found': tth_found,
-                                        'spawns_found': spawns_found}))
-            status['scheduler_status']['tth_found'] = tth_found
+    if (tth_found - status['scheduler_status']['tth_found']) > 0.01:
+        log.debug('Scheduler update is due, sending webhook message.')
+        wh_queue.put(('scheduler', {'name': scheduler_name,
+                                    'instance': args.status_name,
+                                    'tth_found': tth_found,
+                                    'spawns_found': spawns_found}))
+        status['scheduler_status']['tth_found'] = tth_found
 
 
-def get_stats_message(threadStatus):
+def get_stats_message(threadStatus, search_items_queue_array, db_updates_queue,
+                      wh_queue, account_queue, account_failures,
+                      account_captchas):
     overseer = threadStatus['Overseer']
     starttime = overseer['starttime']
     elapsed = now() - starttime
@@ -604,6 +631,7 @@ def get_stats_message(threadStatus):
     if elapsed == 0:
         elapsed = 1
 
+    overseer['elapsed'] = elapsed
     sph = overseer['success_total'] * 3600.0 / elapsed
     fph = overseer['fail_total'] * 3600.0 / elapsed
     eph = overseer['empty_total'] * 3600.0 / elapsed
@@ -612,44 +640,76 @@ def get_stats_message(threadStatus):
     ccost = cph * 0.00299
     cmonth = ccost * 730
 
-    message = ('Total active: {}  |  Success: {} ({:.1f}/hr) | ' +
-               'Fails: {} ({:.1f}/hr) | Empties: {} ({:.1f}/hr) | ' +
-               'Skips {} ({:.1f}/hr) | ' +
-               'Captchas: {} ({:.1f}/hr)|${:.5f}/hr|${:.3f}/mo').format(
-                   overseer['active_accounts'],
-                   overseer['success_total'], sph,
-                   overseer['fail_total'], fph,
-                   overseer['empty_total'], eph,
-                   overseer['skip_total'], skph,
-                   overseer['captcha_total'], cph,
-                   ccost, cmonth)
+    # Print the queue length.
+    search_items_queue_size = 0
+    for i in range(0, len(search_items_queue_array)):
+        search_items_queue_size += search_items_queue_array[i].qsize()
+
+    message = (
+        'Queues: {} search items, {} db updates, {} webhook.  ' +
+        'Spare accounts available: {}. Accounts on hold: {}. ' +
+        'Accounts with captcha: {}\n'
+    ).format(search_items_queue_size,
+             db_updates_queue.qsize(),
+             wh_queue.qsize(),
+             account_queue.qsize(),
+             len(account_failures), len(account_captchas))
+
+    message += (
+        'Total active: {}, busy: {}, idle: {} | ' +
+        'Success: {} ({:.1f}/hr) | ' +
+        'Fails: {} ({:.1f}/hr) | ' +
+        'Empties: {} ({:.1f}/hr) | ' +
+        'Skips {} ({:.1f}/hr) | ' +
+        'Captchas: {} ({:.2f}/hr)|${:.2f}/hr|${:.2f}/mo | ' +
+        'Elapsed: {:.1f}h'
+    ).format(overseer['active_accounts'], overseer['busy_accounts'],
+             (overseer['active_accounts'] - overseer['busy_accounts']),
+             overseer['success_total'], sph,
+             overseer['fail_total'], fph, overseer['empty_total'], eph,
+             overseer['skip_total'], skph, overseer['captcha_total'], cph,
+             ccost, cmonth, elapsed / 3600.0)
 
     return message
 
 
 def update_total_stats(threadStatus, last_account_status):
     overseer = threadStatus['Overseer']
-
     # Calculate totals.
-    usercount = 0
+    active_count = 0
+    busy_count = 0
     current_accounts = Set()
     for tstatus in threadStatus.itervalues():
         if tstatus.get('type', '') == 'Worker':
-            usercount += 1
+
+            is_active = tstatus.get('active', False)
+            if is_active:
+                active_count += 1
+
+            if is_active and tstatus.get('message', '') != 'Nothing to scan.':
+                busy_count += 1
+
             username = tstatus.get('username', '')
             current_accounts.add(username)
             last_status = last_account_status.get(username, {})
             overseer['skip_total'] += stat_delta(tstatus, last_status, 'skip')
-            overseer[
-                'captcha_total'] += stat_delta(tstatus, last_status, 'captcha')
-            overseer[
-                'empty_total'] += stat_delta(tstatus, last_status, 'noitems')
+            overseer['captcha_total'] += stat_delta(tstatus, last_status,
+                                                    'captcha')
+            overseer['empty_total'] += stat_delta(tstatus, last_status,
+                                                  'noitems')
             overseer['fail_total'] += stat_delta(tstatus, last_status, 'fail')
-            overseer[
-                'success_total'] += stat_delta(tstatus, last_status, 'success')
-            last_account_status[username] = copy.deepcopy(tstatus)
+            overseer['success_total'] += stat_delta(tstatus, last_status,
+                                                    'success')
+            last_account_status[username] = {
+                'skip': tstatus['skip'],
+                'captcha': tstatus['captcha'],
+                'noitems': tstatus['noitems'],
+                'fail': tstatus['fail'],
+                'success': tstatus['success']
+            }
 
-    overseer['active_accounts'] = usercount
+    overseer['active_accounts'] = active_count
+    overseer['busy_accounts'] = busy_count
 
     # Remove last status for accounts that workers
     # are not using anymore
@@ -721,9 +781,9 @@ def generate_hive_locations(current_location, step_distance,
     return results
 
 
-def search_worker_thread(args, account_queue, account_failures,
-                         account_captchas, search_items_queue, pause_bit,
-                         status, dbq, whq, scheduler, key_scheduler):
+def search_worker_thread(args, account_queue, account_sets, account_failures,
+                         account_captchas, control_flags, status, dbq, whq,
+                         scheduler, key_scheduler, gym_cache):
 
     log.debug('Search worker thread starting...')
 
@@ -733,39 +793,57 @@ def search_worker_thread(args, account_queue, account_failures,
     # This reinitializes the API and grabs a new account from the queue.
     while True:
         try:
-            # Force storing of previous worker info to keep consistency
+            # Force storing of previous worker info to keep consistency.
             if 'starttime' in status:
                 dbq.put((WorkerStatus, {0: WorkerStatus.db_format(status)}))
 
             status['starttime'] = now()
+            status['active'] = False
 
             # Track per loop.
             first_login = True
 
-            # Make sure the scheduler is done for valid locations
+            # Make sure the scheduler is done for valid locations.
             while not scheduler.ready:
                 time.sleep(1)
 
-            status['message'] = ('Waiting to get new account from the ' +
-                                 'queue...')
+            status['message'] = ('Waiting to get new account from the'
+                                 + ' queue...')
             log.info(status['message'])
 
             # Get an account.
-            account = account_queue.get()
-            status.update(WorkerStatus.get_worker(
-                account['username'], scheduler.scan_location))
-            status['message'] = 'Switching to account {}.'.format(
-                account['username'])
-            log.info(status['message'])
-
-            # New lease of life right here.
-            status['fail'] = 0
-            status['success'] = 0
-            status['noitems'] = 0
-            status['skip'] = 0
-            status['captcha'] = 0
-
             stagger_thread(args)
+            account = account_queue.get()
+            # Reset account statistics tracked per loop.
+            prevStatus = WorkerStatus.get_worker(account['username'])
+            if prevStatus:
+                status.update(prevStatus)
+            else:
+                status.update({
+                    'username': account['username'],
+                    'last_modified': datetime.utcnow(),
+                    'last_scan_date': datetime.utcnow(),
+                    'latitude': None,
+                    'longitude': None
+                })
+            # New lease of life right here.
+            status.update({
+                'fail':
+                    0,
+                'success':
+                    0,
+                'noitems':
+                    0,
+                'skip':
+                    0,
+                'captcha':
+                    0,
+                'active':
+                    True,
+                'message':
+                    'Switching to account {}.'.format(account['username'])
+            })
+            log.info(status['message'])
 
             # Sleep when consecutive_fails reaches max_failures, overall fails
             # for stat purposes.
@@ -775,37 +853,11 @@ def search_worker_thread(args, account_queue, account_failures,
             # for stat purposes.
             consecutive_noitems = 0
 
-            # Create the API instance this will use.
-            if args.mock != '':
-                api = FakePogoApi(args.mock)
-            else:
-                device_info = generate_device_info()
-                api = PGoApi(device_info=device_info)
-
-            # New account - new proxy.
-            if args.proxy:
-                # If proxy is not assigned yet or if proxy-rotation is defined
-                # - query for new proxy.
-                if ((not status['proxy_url']) or
-                        ((args.proxy_rotation is not None) and
-                         (args.proxy_rotation != 'none'))):
-
-                    proxy_num, status['proxy_url'] = get_new_proxy(args)
-                    if args.proxy_display.upper() != 'FULL':
-                        status['proxy_display'] = proxy_num
-                    else:
-                        status['proxy_display'] = status['proxy_url']
-
-            if status['proxy_url']:
-                log.debug('Using proxy %s', status['proxy_url'])
-                api.set_proxy({
-                    'http': status['proxy_url'],
-                    'https': status['proxy_url']})
+            api = setup_api(args, status, account)
 
             # The forever loop for the searches.
             while True:
-
-                while pause_bit.is_set():
+                while is_paused(control_flags):
                     status['message'] = 'Scanning paused.'
                     time.sleep(2)
 
@@ -845,7 +897,7 @@ def search_worker_thread(args, account_queue, account_failures,
                 # If used proxy disappears from "live list" after background
                 # checking - switch account but do not freeze it (it's not an
                 # account failure).
-                if (args.proxy) and (not status['proxy_url'] in args.proxy):
+                if args.proxy and status['proxy_url'] not in args.proxy:
                     status['message'] = (
                         'Account {} proxy {} is not in a live list any ' +
                         'more. Switching accounts...').format(
@@ -871,14 +923,28 @@ def search_worker_thread(args, account_queue, account_failures,
                         break
 
                 # Grab the next thing to search (when available).
-                step, step_location, appears, leaves, messages = (
+                step, scan_coords, appears, leaves, messages, wait = (
                     scheduler.next_item(status))
+
                 status['message'] = messages['wait']
+                # The next_item will return the value telling us how long
+                # to sleep. This way the status can be updated.
+                if wait > 0:
+                    time.sleep(wait)
 
                 # Using step as a flag for no valid next location returned.
                 if step == -1:
                     time.sleep(scheduler.delay(status['last_scan_date']))
                     continue
+
+                # get the ScannedLocation before jittering
+                scan_location = ScannedLocation.get_by_loc(scan_coords)
+
+                # Jitter the coords if configured.
+                if args.jitter:
+                    scan_coords = jitter_location(scan_coords)
+                    log.debug('Jittered to: %f/%f/%f.', scan_coords[0],
+                              scan_coords[1], scan_coords[2])
 
                 # Too soon?
                 # Adding a 10 second grace period.
@@ -886,7 +952,7 @@ def search_worker_thread(args, account_queue, account_failures,
                     first_loop = True
                     paused = False
                     while now() < appears + 10:
-                        if pause_bit.is_set():
+                        if is_paused(control_flags):
                             paused = True
                             break  # Why can't python just have `break 2`...
                         status['message'] = messages['early']
@@ -914,7 +980,7 @@ def search_worker_thread(args, account_queue, account_failures,
                 # Let the api know where we intend to be for this loop.
                 # Doing this before check_login so it does not also have
                 # to be done when the auth token is refreshed.
-                api.set_position(*step_location)
+                api.set_position(*scan_coords)
 
                 if args.hash_key:
                     key = key_scheduler.next()
@@ -923,26 +989,12 @@ def search_worker_thread(args, account_queue, account_failures,
 
                 # Ok, let's get started -- check our login status.
                 status['message'] = 'Logging in...'
-                check_login(args, account, api, step_location,
-                            status['proxy_url'])
+                check_login(args, account, api, status['proxy_url'])
 
                 # Only run this when it's the account's first login, after
                 # check_login().
                 if first_login:
                     first_login = False
-
-                    # Check tutorial completion.
-                    if args.complete_tutorial:
-                        tutorial_state = get_tutorial_state(api, account)
-
-                        if not all(x in tutorial_state
-                                   for x in (0, 1, 3, 4, 7)):
-                            log.info('Completing tutorial steps for %s.',
-                                     account['username'])
-                            complete_tutorial(api, account, tutorial_state)
-                        else:
-                            log.info('Account %s already completed tutorial.',
-                                     account['username'])
 
                 # Putting this message after the check_login so the messages
                 # aren't out of order.
@@ -951,13 +1003,13 @@ def search_worker_thread(args, account_queue, account_failures,
 
                 # Make the actual request.
                 scan_date = datetime.utcnow()
-                response_dict = map_request(api, step_location, args.no_jitter)
+                response_dict = gmo(api, account, scan_coords)
                 status['last_scan_date'] = datetime.utcnow()
 
                 # Record the time and the place that the worker made the
                 # request.
-                status['latitude'] = step_location[0]
-                status['longitude'] = step_location[1]
+                status['latitude'] = scan_coords[0]
+                status['longitude'] = scan_coords[1]
                 dbq.put((WorkerStatus, {0: WorkerStatus.db_format(status)}))
 
                 # Nothing back. Mark it up, sleep, carry on.
@@ -975,20 +1027,22 @@ def search_worker_thread(args, account_queue, account_failures,
                     captcha = handle_captcha(args, status, api, account,
                                              account_failures,
                                              account_captchas, whq,
-                                             response_dict, step_location)
+                                             response_dict, scan_coords)
                     if captcha is not None and captcha:
                         # Make another request for the same location
                         # since the previous one was captcha'd.
                         scan_date = datetime.utcnow()
-                        response_dict = map_request(api, step_location,
-                                                    args.no_jitter)
+                        response_dict = gmo(api, account, scan_coords)
                     elif captcha is not None:
                         account_queue.task_done()
                         time.sleep(3)
                         break
 
-                    parsed = parse_map(args, response_dict, step_location,
-                                       dbq, whq, api, scan_date)
+                    parsed = parse_map(args, response_dict, scan_coords,
+                                       scan_location, dbq, whq, key_scheduler,
+                                       api, status, scan_date, account,
+                                       account_sets)
+
                     scheduler.task_done(status, parsed)
                     if parsed['count'] > 0:
                         status['success'] += 1
@@ -999,7 +1053,7 @@ def search_worker_thread(args, account_queue, account_failures,
                     consecutive_fails = 0
                     status['message'] = ('Search at {:6f},{:6f} completed ' +
                                          'with {} finds.').format(
-                        step_location[0], step_location[1],
+                        scan_coords[0], scan_coords[1],
                         parsed['count'])
                     log.debug(status['message'])
                 except Exception as e:
@@ -1010,28 +1064,44 @@ def search_worker_thread(args, account_queue, account_failures,
                     # counter in case of error.
                     status['message'] = ('Map parse failed at {:6f},{:6f}, ' +
                                          'abandoning location. {} may be ' +
-                                         'banned.').format(step_location[0],
-                                                           step_location[1],
+                                         'banned.').format(scan_coords[0],
+                                                           scan_coords[1],
                                                            account['username'])
                     log.exception('{}. Exception message: {}'.format(
                         status['message'], repr(e)))
+                finally:
+                    if response_dict is not None:
+                        del response_dict
 
                 # Get detailed information about gyms.
                 if args.gym_info and parsed:
                     # Build a list of gyms to update.
                     gyms_to_update = {}
                     for gym in parsed['gyms'].values():
-                        # Can only get gym details within 450m of our position.
-                        distance = calc_distance(
-                            step_location, [gym['latitude'], gym['longitude']])
-                        if distance < 0.45:
+                        with gym_cache_lock:
+                            if gym['gym_id'] in gym_cache:
+                                log.debug(
+                                    ('Skipping update of gym @ %f/%f, ' +
+                                     'already in progress.'),
+                                    gym['latitude'], gym['longitude'])
+                                continue
+                            else:
+                                # Set the gym as in progress it will just be
+                                # locked for 60 seconds due to TTL eviction.
+                                gym_cache[gym['gym_id']] = True
+
+                        # Can only get gym details within 1km of our position.
+                        gym_distance = distance(
+                            scan_coords, [gym['latitude'], gym['longitude']])
+                        if gym_distance < 1000:
                             # Check if we already have details on this gym.
                             # Get them if not.
                             try:
                                 record = GymDetails.get(gym_id=gym['gym_id'])
-                            except GymDetails.DoesNotExist as e:
+                            except GymDetails.DoesNotExist:
                                 gyms_to_update[gym['gym_id']] = gym
                                 continue
+                            GymDetails.database().close()
 
                             # If we have a record of this gym already, check if
                             # the gym has been updated since our last update.
@@ -1046,70 +1116,98 @@ def search_worker_thread(args, account_queue, account_failures,
                                 continue
                         else:
                             log.debug(
-                                ('Skipping update of gym @ %f/%f, too far ' +
-                                 'away from our location at %f/%f (%fkm).'),
+                                'Skipping update of gym @ %f/%f, too far ' +
+                                'away from our location at %f/%f (%.0fm).',
                                 gym['latitude'], gym['longitude'],
-                                step_location[0], step_location[1], distance)
+                                scan_coords[0], scan_coords[1],
+                                gym_distance)
 
                     if len(gyms_to_update):
                         gym_responses = {}
                         current_gym = 1
                         status['message'] = (
                             'Updating {} gyms for location {},{}...').format(
-                                len(gyms_to_update), step_location[0],
-                                step_location[1])
+                                len(gyms_to_update), scan_coords[0],
+                                scan_coords[1])
                         log.debug(status['message'])
 
                         for gym in gyms_to_update.values():
+                            time.sleep(random.random() + 2)
                             status['message'] = (
                                 'Getting details for gym {} of {} for ' +
                                 'location {:6f},{:6f}...').format(
-                                    current_gym, len(gyms_to_update),
-                                    step_location[0], step_location[1])
-                            time.sleep(random.random() + 2)
-                            response = gym_request(api, step_location, gym)
+                                    current_gym,
+                                    len(gyms_to_update), scan_coords[0],
+                                    scan_coords[1])
+                            log.info('Getting details for gym @ %f/%f ' +
+                                     '(%.0fm away)', gym['latitude'],
+                                     gym['longitude'],
+                                     distance(scan_coords, [
+                                         gym['latitude'], gym['longitude']
+                                     ]))
+
+                            response = gym_get_info(api, account,
+                                                    scan_coords, gym)
 
                             # Make sure the gym was in range. (Sometimes the
                             # API gets cranky about gyms that are ALMOST 1km
                             # away.)
                             if response['responses'][
-                                    'GET_GYM_DETAILS']['result'] == 2:
+                                    'GYM_GET_INFO'].result == 2:
                                 log.warning(
-                                    ('Gym @ %f/%f is out of range (%dkm), ' +
-                                     'skipping.'),
-                                    gym['latitude'], gym['longitude'],
-                                    distance)
+                                    'Gym @ %f/%f is out of range (%.0fm), ' +
+                                    'skipping.', gym['latitude'],
+                                    gym['longitude'], distance)
                             else:
                                 gym_responses[gym['gym_id']] = response[
-                                    'responses']['GET_GYM_DETAILS']
-
+                                    'responses']['GYM_GET_INFO']
+                            del response
                             # Increment which gym we're on for status messages.
                             current_gym += 1
 
                         status['message'] = (
                             'Processing details of {} gyms for location ' +
                             '{:6f},{:6f}...').format(len(gyms_to_update),
-                                                     step_location[0],
-                                                     step_location[1])
+                                                     scan_coords[0],
+                                                     scan_coords[1])
                         log.debug(status['message'])
 
                         if gym_responses:
                             parse_gyms(args, gym_responses,
                                        whq, dbq)
+                            del gym_responses
 
+                # Update hashing key stats in the database based on the values
+                # reported back by the hashing server.
                 if args.hash_key:
-                    key_instance = key_scheduler.keys[key_scheduler.current()]
+                    key = HashServer.status.get('token', None)
+                    key_instance = key_scheduler.keys[key]
                     key_instance['remaining'] = HashServer.status.get(
                         'remaining', 0)
 
-                    if key_instance['maximum'] == 0:
-                        key_instance['maximum'] = HashServer.status.get(
-                            'maximum', 0)
+                    key_instance['maximum'] = (
+                        HashServer.status.get('maximum', 0))
 
-                    peak = key_instance['maximum'] - key_instance['remaining']
+                    usage = (
+                        key_instance['maximum'] -
+                        key_instance['remaining'])
 
-                    if key_instance['peak'] < peak:
-                        key_instance['peak'] = peak
+                    if key_instance['peak'] < usage:
+                        key_instance['peak'] = usage
+
+                    if key_instance['expires'] is None:
+                        expires = HashServer.status.get(
+                            'expiration', None)
+
+                        if expires is not None:
+                            expires = datetime.utcfromtimestamp(expires)
+                            key_instance['expires'] = expires
+
+                    key_instance['last_updated'] = datetime.utcnow()
+
+                    log.debug('Hash key %s has %s/%s RPM left.', key,
+                              key_instance['remaining'],
+                              key_instance['maximum'])
 
                 # Delay the desired amount after "scan" completion.
                 delay = scheduler.delay(status['last_scan_date'])
@@ -1119,99 +1217,39 @@ def search_worker_thread(args, account_queue, account_failures,
                     time.strftime(
                         '%H:%M:%S',
                         time.localtime(time.time() + args.scan_delay)))
-
+                log.debug(status['message'])
                 time.sleep(delay)
 
         # Catch any process exceptions, log them, and continue the thread.
         except Exception as e:
-            log.error((
-                'Exception in search_worker under account {} Exception ' +
-                'message: {}.').format(account['username'], repr(e)))
+            log.exception(
+                'Exception in search_worker under account %s.',
+                account['username'])
+            status['active'] = False
             status['message'] = (
                 'Exception in search_worker using account {}. Restarting ' +
                 'with fresh account. See logs for details.').format(
                     account['username'])
-            traceback.print_exc(file=sys.stdout)
             account_failures.append({'account': account,
                                      'last_fail_time': now(),
                                      'reason': 'exception'})
             time.sleep(args.scan_delay)
 
 
-def map_request(api, position, no_jitter=False):
-    # Create scan_location to send to the api based off of position, because
-    # tuples aren't mutable.
-    if no_jitter:
-        # Just use the original coordinates.
-        scan_location = position
-    else:
-        # Jitter it, just a little bit.
-        scan_location = jitter_location(position)
-        log.debug('Jittered to: %f/%f/%f',
-                  scan_location[0], scan_location[1], scan_location[2])
+def upsertKeys(keys, key_scheduler, db_updates_queue):
+    # Prepare hashing keys to be sent to the database.
+    # Keep highest peak value stored.
+    hashkeys = {}
+    stored_peaks = HashKeys.get_stored_peaks()
+    for key, instance in key_scheduler.keys.iteritems():
+        hashkeys[key] = instance
+        hashkeys[key]['key'] = key
 
-    try:
-        cell_ids = util.get_cell_ids(scan_location[0], scan_location[1])
-        timestamps = [0, ] * len(cell_ids)
-        req = api.create_request()
-        response = req.get_map_objects(latitude=f2i(scan_location[0]),
-                                       longitude=f2i(scan_location[1]),
-                                       since_timestamp_ms=timestamps,
-                                       cell_id=cell_ids)
-        response = req.check_challenge()
-        response = req.get_hatched_eggs()
-        response = req.get_inventory()
-        response = req.check_awarded_badges()
-        response = req.download_settings()
-        response = req.get_buddy_walked()
-        response = req.call()
-        return response
+        if key in stored_peaks:
+            max_peak = max(instance['peak'], stored_peaks[key])
+            hashkeys[key]['peak'] = max_peak
 
-    except Exception as e:
-        log.warning('Exception while downloading map: %s', repr(e))
-        return False
-
-
-def gym_request(api, position, gym):
-    try:
-        log.debug('Getting details for gym @ %f/%f (%fkm away)',
-                  gym['latitude'], gym['longitude'],
-                  calc_distance(position, [gym['latitude'], gym['longitude']]))
-        req = api.create_request()
-        x = req.get_gym_details(gym_id=gym['gym_id'],
-                                player_latitude=f2i(position[0]),
-                                player_longitude=f2i(position[1]),
-                                gym_latitude=gym['latitude'],
-                                gym_longitude=gym['longitude'])
-        x = req.check_challenge()
-        x = req.get_hatched_eggs()
-        x = req.get_inventory()
-        x = req.check_awarded_badges()
-        x = req.download_settings()
-        x = req.get_buddy_walked()
-        x = req.call()
-        # Print pretty(x).
-        return x
-
-    except Exception as e:
-        log.warning('Exception while downloading gym details: %s', repr(e))
-        return False
-
-
-def calc_distance(pos1, pos2):
-    R = 6378.1  # KM radius of the earth.
-
-    dLat = math.radians(pos1[0] - pos2[0])
-    dLon = math.radians(pos1[1] - pos2[1])
-
-    a = math.sin(dLat / 2) * math.sin(dLat / 2) + \
-        math.cos(math.radians(pos1[0])) * math.cos(math.radians(pos2[0])) * \
-        math.sin(dLon / 2) * math.sin(dLon / 2)
-
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    d = R * c
-
-    return d
+    db_updates_queue.put((HashKeys, hashkeys))
 
 
 # Delay each thread start time so that logins occur after delay.
@@ -1228,25 +1266,62 @@ def stat_delta(current_status, last_status, stat_name):
     return current_status.get(stat_name, 0) - last_status.get(stat_name, 0)
 
 
-def check_forced_version(args, api_version, api_check_time, pause_bit):
+def check_forced_version(args, api_check_time, api_watchdog_flag):
     if int(time.time()) > api_check_time:
+        log.debug("Checking forced API version.")
         api_check_time = int(time.time()) + args.version_check_interval
         forced_api = get_api_version(args)
 
-        if (api_version != forced_api and forced_api != 0):
-            pause_bit.set()
-            log.info(('Started with API: {}, ' +
-                      'Niantic forced to API: {}').format(
-                api_version,
-                forced_api))
-            log.info('Scanner paused due to forced Niantic API update.')
-            log.info('Stop the scanner process until RocketMap ' +
-                     'has updated.')
+        if not forced_api:
+            # Couldn't retrieve API version. Pause scanning.
+            api_watchdog_flag.set()
+            log.warning('Forced API check got no or invalid response. ' +
+                        'Possible bad proxy.')
+            log.warning('Scanner paused due to failed API check.')
+            return api_check_time
+
+        # Got a response let's compare version numbers.
+        try:
+            if StrictVersion(args.api_version) < StrictVersion(forced_api):
+                # Installed API version is lower. Pause scanning.
+                api_watchdog_flag.set()
+                log.warning('Started with API: %s, ' +
+                            'Niantic forced to API: %s',
+                            args.api_version,
+                            forced_api)
+                log.warning('Scanner paused due to forced Niantic API update.')
+            else:
+                # API check was successful and
+                # installed API version is newer or equal forced API.
+                # Continue scanning.
+                log.debug("API check was successful. Continue scanning.")
+                api_watchdog_flag.clear()
+
+        except ValueError:
+            # Unknown version format. Pause scanning as well.
+            api_watchdog_flag.set()
+            log.warning('Niantic forced unknown API version format: %s.',
+                        forced_api)
+            log.warning('Scanner paused due to unknown API version format.')
+        except Exception as e:
+            # Something else happened. Pause scanning as well.
+            api_watchdog_flag.set()
+            log.warning('Unknown error on API version comparison: %s.',
+                        repr(e))
+            log.warning('Scanner paused due to unknown API check error.')
 
     return api_check_time
 
 
 def get_api_version(args):
+    """Retrieve forced API version by Niantic
+
+    Args:
+        args: Command line arguments
+
+    Returns:
+        API version string. False if request failed.
+    """
     proxies = {}
 
     if args.proxy:
@@ -1260,15 +1335,23 @@ def get_api_version(args):
         s = requests.Session()
         s.mount('https://',
                 HTTPAdapter(max_retries=Retry(total=3,
-                                              backoff_factor=0.1,
+                                              backoff_factor=0.5,
                                               status_forcelist=[500, 502,
                                                                 503, 504])))
         r = s.get(
             'https://pgorelease.nianticlabs.com/plfe/version',
             proxies=proxies,
-            verify=False)
-        return r.text[2:] if (r.status_code == requests.codes.ok and
-                              r.text[2:].count('.') == 2) else 0
+            verify=False,
+            timeout=5)
+
+        return r.text[2:] if r.status_code == requests.codes.ok else False
     except Exception as e:
         log.warning('error on API check: %s', repr(e))
-        return 0
+        return False
+
+
+def is_paused(control_flags):
+    for flag in control_flags.values():
+        if flag.is_set():
+            return True
+    return False

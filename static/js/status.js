@@ -1,30 +1,65 @@
-/* Shared */
-var monthArray = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-
 /* Main stats page */
 var rawDataIsLoading = false
 var statusPagePassword = false
-var groupByWorker = true
+var showHashTable = true
+var showInstances = true
+var showWorkers = true
+var hashkeys = {}
+var statshash = 'summarystats'  /* unique statistics worker name */
+var scansSuccess
+var scansFailed
+var scansEmpty
+var scansSkipped
+var captchasCount
+var mainWorkers
+var elapsedTotal
+var elapsedSecs
+var elapsedHours
+var successPerHour
+var failsPerHour
+var emptyPerHour
+var skippedPerHour
+var captchasPerHour
+var captchasCost
+var captchasCostMonthly
 
 // Raw data updating
 var minUpdateDelay = 1000 // Minimum delay between updates (in ms).
 var lastRawUpdateTime = new Date()
 
+function getFormattedDate(unFormattedDate) { // eslintrc no-undef.
+    // Use YYYY-MM-DD HH:MM:SS formatted dates to enable simple sorting.
+    return moment(unFormattedDate).format('YYYY-MM-DD HH:mm:ss')
+}
 
 /*
  * Workers
  */
 function addMainWorker(hash) {
-    var worker = `
-     <div id="worker_${hash}" class="worker">
-       <span id="name_${hash}" class="name"></span>
-       <span id="method_${hash}" class="method"></span>
-       <span id="message_${hash}" class="message"></span>
-     </div>
-   `
+    var worker
+    if (showInstances && !showWorkers) {
+        worker = `
+        <div id="worker_${hash}" class="worker">
+            <span id="name_${hash}" class="name"></span>
+            <span id="method_${hash}" class="method"></span>
+            <span id="message_${hash}" class="message"></span>
+            <br>
+        </div>
+        `
+    } else {
+        worker = `
+        <div id="worker_${hash}" class="worker">
+            <span id="name_${hash}" class="name"></span>
+            <span id="method_${hash}" class="method"></span>
+            <span id="message_${hash}" class="message"></span>
+        </div>
+        `
+    }
 
     $(worker).appendTo('#status_container')
-    addTable(hash)
+    if (showWorkers) {
+        addTable(hash)
+    }
 }
 
 function processMainWorker(i, worker) {
@@ -33,6 +68,7 @@ function processMainWorker(i, worker) {
     if ($('#worker_' + hash).length === 0) {
         addMainWorker(hash)
     }
+
 
     $('#name_' + hash).html(worker['worker_name'])
     $('#method_' + hash).html('(' + worker['method'] + ')')
@@ -52,14 +88,28 @@ function addWorker(mainWorkerHash, workerHash) {
        <div id="message_${workerHash}"  class="status_cell"/>
      </div>
    `
-
     $(row).appendTo('#table_' + mainWorkerHash)
 }
 
+function addHashtable(mainKeyHash, keyHash) {
+    var hashrow = `
+    <div id="hashrow_${keyHash}" class="status_row">
+      <div id="key_${keyHash}" class="status_cell"/>
+      <div id="maximum_${keyHash}" class="status_cell"/>
+      <div id="remaining_${keyHash}" class="status_cell"/>
+      <div id="usage_${keyHash}" class="status_cell"/>
+      <div id="peak_${keyHash}" class="status_cell"/>
+      <div id="expires_${keyHash}" class="status_cell"/>
+      <div id="last_updated_${keyHash}" class="status_cell"/>
+    </div>
+    `
+    $(hashrow).appendTo('#hashtable_' + mainKeyHash)
+}
+
 function processWorker(i, worker) {
-    var hash = hashFnv32a(worker['username'], true)
+    const hash = hashFnv32a(worker['username'], true)
     var mainWorkerHash
-    if (groupByWorker) {
+    if (showWorkers && showInstances) {
         mainWorkerHash = hashFnv32a(worker['worker_name'], true)
         if ($('#table_' + mainWorkerHash).length === 0) {
             return
@@ -75,13 +125,7 @@ function processWorker(i, worker) {
         addWorker(mainWorkerHash, hash)
     }
 
-    var lastModified = new Date(worker['last_modified'])
-    lastModified = lastModified.getHours() + ':' +
-        ('0' + lastModified.getMinutes()).slice(-2) + ':' +
-        ('0' + lastModified.getSeconds()).slice(-2) + ' ' +
-        lastModified.getDate() + ' ' +
-        monthArray[lastModified.getMonth()] + ' ' +
-        lastModified.getFullYear()
+    const lastModified = getFormattedDate(new Date(worker['last_modified']))
 
     $('#username_' + hash).html(worker['username'])
     $('#success_' + hash).html(worker['success'])
@@ -93,17 +137,119 @@ function processWorker(i, worker) {
     $('#message_' + hash).html(worker['message'])
 }
 
-function parseResult(result) {
-    if (groupByWorker) {
-        $.each(result.main_workers, processMainWorker)
+function processHashKeys(i, hashkey) {
+    const key = hashkey['key']
+    const keyHash = hashFnv32a(key, true)
+    if ($('#hashtable_global').length === 0) {
+        createHashTable('global')
     }
-    $.each(result.workers, processWorker)
+
+    if ($('#hashrow_' + keyHash).length === 0) {
+        addHashtable('global', keyHash)
+        const keyValues = {
+            samples: [],
+            nextSampleIndex: 0
+        }
+
+        hashkeys[key] = keyValues
+    }
+
+    // Calculate average value for Hash keys.
+    const writeIndex = hashkeys[key].nextSampleIndex % 60
+    hashkeys[key].nextSampleIndex += 1
+    hashkeys[key].samples[writeIndex] = hashkey['maximum'] - hashkey['remaining']
+    const numSamples = hashkeys[key].samples.length
+    var sumSamples = 0
+    for (var j = 0; j < numSamples; j++) {
+        sumSamples += hashkeys[key].samples[j]
+    }
+
+    const usage = sumSamples / Math.max(numSamples, 1) // Avoid division by zero.
+
+    const lastUpdated = getFormattedDate(new Date(hashkey['last_updated']))
+    var expires = getFormattedDate(new Date(hashkey['expires']))
+    if (!moment(expires).unix()) {
+        expires = 'Unknown/Invalid'
+    } else if (moment().isSameOrAfter(moment(expires))) {
+        expires = 'Expired'
+    }
+
+    $('#key_' + keyHash).html(key)
+    $('#maximum_' + keyHash).html(hashkey['maximum'])
+    $('#remaining_' + keyHash).html(hashkey['remaining'])
+    $('#usage_' + keyHash).html(usage.toFixed(2))
+    $('#peak_' + keyHash).html(hashkey['peak'])
+    $('#last_updated_' + keyHash).html(lastUpdated)
+    $('#expires_' + keyHash).html(expires)
 }
 
-
+function parseResult(result) {
+    addTotalStats(result)
+    if (showInstances) {
+        $.each(result.main_workers, processMainWorker)
+    }
+    if (showWorkers) {
+        $.each(result.workers, processWorker)
+    }
+    if (showHashTable) {
+        $.each(result.hashkeys, processHashKeys)
+    }
+}
 /*
  * Tables
  */
+function createHashTable(mainKeyHash) {
+    var hashtable = `
+    <div class="status_table" id="hashtable_${mainKeyHash}">
+     <div class="status_row header">
+     <div class="status_cell">
+       Hash Keys
+      </div>
+      <div class="status_cell">
+        Maximum RPM
+      </div>
+      <div class="status_cell">
+        RPM Left
+      </div>
+      <div class="status_cell">
+        Usage
+        </div>
+      <div class="status_cell">
+        Peak
+        </div>
+       <div class="status_cell">
+         Expires At
+       </div>
+       <div class="status_cell">
+         Last Modified
+       </div>
+     </div>
+   </div>`
+
+    hashtable = $(hashtable)
+    $('#status_container').prepend(hashtable)
+    $(hashtable).find('.status_row.header .status_cell').click(sortHashTable)
+}
+
+function sortHashTable() {
+    var hashtable = $(this).parents('.status_table').first()
+    var comparator = compareHashTable($(this).index())
+    var hashrow = hashtable.find('.status_row:gt(0)').toArray()
+    // Sort the array.
+    hashrow.sort(comparator)
+    this.asc = !this.asc
+    if (!this.asc) {
+        hashrow = hashrow.reverse()
+    }
+    for (var i = 0; i < hashrow.length; i++) {
+        hashtable.append(hashrow[i])
+    }
+}
+
+function getHashtableValue(hashrow, index) {
+    return $(hashrow).children('.status_cell').eq(index).html()
+}
+
 function addTable(hash) {
     var table = `
      <div class="status_table" id="table_${hash}">
@@ -133,8 +279,7 @@ function addTable(hash) {
            Message
          </div>
        </div>
-     </div>
-   `
+     </div>`
 
     table = $(table)
     table.appendTo('#status_container')
@@ -142,8 +287,11 @@ function addTable(hash) {
 }
 
 function tableSort() {
-    var table = $(this).parents('.status_table').eq(0)
-    var rows = table.find('.status_row:gt(0)').toArray().sort(compare($(this).index()))
+    var table = $(this).parents('.status_table').first()
+    var comparator = compare($(this).index())
+    var rows = table.find('.status_row:gt(0)').toArray()
+    // Sort the array.
+    rows.sort(comparator)
     this.asc = !this.asc
     if (!this.asc) {
         rows = rows.reverse()
@@ -157,7 +305,6 @@ function getCellValue(row, index) {
     return $(row).children('.status_cell').eq(index).html()
 }
 
-
 /*
  * Helpers
  */
@@ -169,7 +316,16 @@ function compare(index) {
     }
 }
 
+function compareHashTable(index) {
+    return function (a, b) {
+        var valA = getHashtableValue(a, index)
+        var valB = getHashtableValue(b, index)
+        return $.isNumeric(valA) && $.isNumeric(valB) ? valA - valB : valA.localeCompare(valB)
+    }
+}
+
 function updateStatus() {
+    lastRawUpdateTime = new Date()
     loadRawData().done(function (result) {
         // Parse result on success.
         parseResult(result)
@@ -182,6 +338,95 @@ function updateStatus() {
         // Don't use interval.
         window.setTimeout(updateStatus, delay)
     })
+}
+
+/*
+ * Generate Statistics Across All Workers
+ */
+function addStatsWorker(hash) {
+    var worker = `
+    <div id="worker_${hash}" class="worker">
+    <span id="name_${hash}" class="name"></span>
+    <span id="method_${hash}" class="method"></span>
+    <span id="message_${hash}" class="message"></span>
+    </div>
+    `
+
+    $('#stats_worker').html(worker)
+}
+
+function getStats(i, worker) {
+    scansSuccess += worker['success']
+    scansFailed += worker['fail']
+    scansEmpty += worker['empty']
+    scansSkipped += worker['skip']
+    captchasCount += worker['captcha']
+    mainWorkers += 1
+
+    elapsedTotal += worker['elapsed']
+    elapsedSecs = elapsedTotal / (i + 1)
+    elapsedHours = elapsedSecs / 3600
+}
+
+function addTotalStats(result) {
+    var statmsg, title
+    scansSuccess = 0
+    scansFailed = 0
+    scansEmpty = 0
+    scansSkipped = 0
+    captchasCount = 0
+    mainWorkers = 0
+    elapsedTotal = 0
+    elapsedSecs = 0
+    elapsedHours = 0
+    successPerHour = 0
+    failsPerHour = 0
+    emptyPerHour = 0
+    skippedPerHour = 0
+    captchasPerHour = 0
+    captchasCost = 0
+    captchasCostMonthly = 0
+
+    $.each(result.main_workers, getStats)
+
+    if ((mainWorkers > 1) || !(showWorkers && showInstances)) {
+        const accountsActive = result.workers.length
+
+        // Calculate the number of idle workers and then busy from that.
+        const accountsIdle = result.workers.reduce((accumulator, account) => {
+            if (account['message'] === 'Nothing to scan.') {
+                accumulator += 1
+            }
+            return accumulator
+        }, 0)
+
+        const accountsBusy = result.workers.length - accountsIdle
+
+        // Avoid division by zero.
+        elapsedSecs = Math.max(elapsedSecs, 1)
+
+        successPerHour = (scansSuccess * 3600 / elapsedSecs) || 0
+        failsPerHour = (scansFailed * 3600 / elapsedSecs) || 0
+        emptyPerHour = (scansEmpty * 3600 / elapsedSecs) || 0
+        skippedPerHour = (scansSkipped * 3600 / elapsedSecs) || 0
+        captchasPerHour = (captchasCount * 3600 / elapsedSecs) || 0
+        captchasCost = captchasPerHour * 0.00299
+        captchasCostMonthly = captchasCost * 730
+
+        if ($('#worker_' + statshash).length === 0) {
+            addStatsWorker(statshash)
+        }
+
+        statmsg = 'Total active: ' + accountsActive + ', busy: ' + accountsBusy + ', idle: ' + accountsIdle + ' | Success: ' + scansSuccess.toFixed() + ' (' + successPerHour.toFixed(1) + '/hr) | Fails: ' + scansFailed.toFixed() + ' (' + failsPerHour.toFixed(1) + '/hr) | Empties: ' + scansEmpty.toFixed() + ' (' + emptyPerHour.toFixed(1) + '/hr) | Skips: ' + scansSkipped.toFixed() + ' (' + skippedPerHour.toFixed(1) + '/hr) | Captchas: ' + captchasCount.toFixed() + ' (' + captchasPerHour.toFixed(1) + '/hr) ($' + captchasCost.toFixed(2) + '/hr, $' + captchasCostMonthly.toFixed(2) + '/mo) | Elapsed:  ' + elapsedHours.toFixed(1) + 'h<hr />'
+        if (mainWorkers > 1) {
+            title = '(Total Statistics across ' + mainWorkers + ' instances)'
+        } else {
+            title = '(Total Statistics across ' + mainWorkers + ' instance)'
+        }
+        $('#name_' + statshash).html('All Instances')
+        $('#method_' + statshash).html(title)
+        $('#message_' + statshash).html(statmsg)
+    }
 }
 
 /**
@@ -260,14 +505,25 @@ $(document).ready(function () {
         })
     })
 
-    $('#groupbyworker-switch').change(function () {
-        groupByWorker = this.checked
+
+    $('#hashkey-switch').change(function () {
+        showHashTable = this.checked
 
         $('#status_container .status_table').remove()
         $('#status_container .worker').remove()
+    })
 
-        if (statusPagePassword) {
-            updateStatus()
-        }
+    $('#showworker-switch').change(function () {
+        showWorkers = this.checked
+
+        $('#status_container .status_table').remove()
+        $('#status_container .worker').remove()
+    })
+
+    $('#showinstances-switch').change(function () {
+        showInstances = this.checked
+
+        $('#status_container .status_table').remove()
+        $('#status_container .worker').remove()
     })
 })

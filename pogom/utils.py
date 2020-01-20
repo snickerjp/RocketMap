@@ -2,23 +2,30 @@
 # -*- coding: utf-8 -*-
 
 import sys
-import configargparse
 import os
-import math
 import json
 import logging
-import shutil
-import pprint
 import random
 import time
 import socket
 import struct
-import zipfile
+import hashlib
+import psutil
+import subprocess
 import requests
-from uuid import uuid4
-from s2sphere import CellId, LatLng
+import configargparse
 
-from . import config
+from s2sphere import CellId, LatLng
+from geopy.geocoders import GoogleV3
+from requests_futures.sessions import FuturesSession
+from requests.packages.urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+from cHaversine import haversine
+from pprint import pformat
+from time import strftime
+from timeit import default_timer
+
+from pgoapi.hash_server import HashServer
 
 log = logging.getLogger(__name__)
 
@@ -26,13 +33,6 @@ log = logging.getLogger(__name__)
 def parse_unicode(bytestring):
     decoded_string = bytestring.decode(sys.getfilesystemencoding())
     return decoded_string
-
-
-def verify_config_file_exists(filename):
-    fullpath = os.path.join(os.path.dirname(__file__), filename)
-    if not os.path.exists(fullpath):
-        log.info('Could not find %s, copying default.', filename)
-        shutil.copy2(fullpath + '.example', fullpath)
 
 
 def memoize(function):
@@ -61,7 +61,9 @@ def get_args():
         default_config_files=defaultconfigfiles,
         auto_env_var_prefix='POGOMAP_')
     parser.add_argument('-cf', '--config',
-                        is_config_file=True, help='Configuration file')
+                        is_config_file=True, help='Set configuration file')
+    parser.add_argument('-scf', '--shared-config',
+                        is_config_file=True, help='Set a shared config')
     parser.add_argument('-a', '--auth-service', type=str.lower,
                         action='append', default=[],
                         help=('Auth Services, either one for all accounts ' +
@@ -85,11 +87,16 @@ def get_args():
                               'or are switched out.'))
     parser.add_argument('-ac', '--accountcsv',
                         help=('Load accounts from CSV file containing ' +
-                              '"auth_service,username,passwd" lines.'))
+                              '"auth_service,username,password" lines.'))
+    parser.add_argument('-hlvl', '--high-lvl-accounts',
+                        help=('Load high level accounts from CSV file '
+                              + ' containing '
+                              + '"auth_service,username,password"'
+                              + ' lines.'))
     parser.add_argument('-bh', '--beehive',
                         help=('Use beehive configuration for multiple ' +
                               'accounts, one account per hex.  Make sure ' +
-                              'to keep -st under 5, and -w under the total' +
+                              'to keep -st under 5, and -w under the total ' +
                               'amount of accounts available.'),
                         action='store_true', default=False)
     parser.add_argument('-wph', '--workers-per-hive',
@@ -112,12 +119,24 @@ def get_args():
                               ' rather than only once, and store results in' +
                               ' the database.'),
                         action='store_true', default=False)
-    parser.add_argument('-nj', '--no-jitter',
-                        help=("Don't apply random -9m to +9m jitter to " +
-                              "location."),
+    parser.add_argument('-j', '--jitter',
+                        help=('Apply random -5m to +5m jitter to ' +
+                              'location.'),
+                        action='store_true', default=False)
+    parser.add_argument('-al', '--access-logs',
+                        help=("Write web logs to access.log."),
                         action='store_true', default=False)
     parser.add_argument('-st', '--step-limit', help='Steps.', type=int,
                         default=12)
+    parser.add_argument('-gf', '--geofence-file',
+                        help=('Geofence file to define outer borders of the ' +
+                              'scan area.'),
+                        default='')
+    parser.add_argument('-gef', '--geofence-excluded-file',
+                        help=('File to define excluded areas inside scan ' +
+                              'area. Regarded this as inverted geofence. ' +
+                              'Can be combined with geofence-file.'),
+                        default='')
     parser.add_argument('-sd', '--scan-delay',
                         help='Time delay between requests in scan threads.',
                         type=float, default=10)
@@ -152,23 +171,42 @@ def get_args():
                         help=('Time delay between encounter pokemon ' +
                               'in scan threads.'),
                         type=float, default=1)
-    encounter_list = parser.add_mutually_exclusive_group()
-    encounter_list.add_argument('-ewht', '--encounter-whitelist',
-                                action='append', default=[],
-                                help=('List of Pokemon to encounter for ' +
-                                      'more stats.'))
-    encounter_list.add_argument('-eblk', '--encounter-blacklist',
-                                action='append', default=[],
-                                help=('List of Pokemon to NOT encounter for ' +
-                                      'more stats.'))
-    encounter_list.add_argument('-ewhtf', '--encounter-whitelist-file',
-                                default='', help='File containing a list of '
-                                                 'Pokemon to encounter for'
-                                                 ' more stats.')
-    encounter_list.add_argument('-eblkf', '--encounter-blacklist-file',
-                                default='', help='File containing a list of '
-                                                 'Pokemon to NOT encounter for'
-                                                 ' more stats.')
+    parser.add_argument('-ignf', '--ignorelist-file',
+                        default='', help='File containing a list of ' +
+                        'Pokemon IDs to ignore, one line per ID. ' +
+                        'Spawnpoints will be saved, but ignored ' +
+                        'Pokemon won\'t be encountered, sent to ' +
+                        'webhooks or saved to the DB.')
+    parser.add_argument('-encwf', '--enc-whitelist-file',
+                        default='', help='File containing a list of '
+                        'Pokemon IDs to encounter for'
+                        ' IV/CP scanning. One line per ID.')
+    parser.add_argument('-nostore', '--no-api-store',
+                        help=("Don't store the API objects used by the high"
+                              + ' level accounts in memory. This will increase'
+                              + ' the number of logins per account, but '
+                              + ' decreases memory usage.'),
+                        action='store_true', default=False)
+    parser.add_argument('-apir', '--api-retries',
+                        help=('Number of times to retry an API request.'),
+                        type=int, default=3)
+    webhook_list = parser.add_mutually_exclusive_group()
+    webhook_list.add_argument('-wwht', '--webhook-whitelist',
+                              action='append', default=[],
+                              help=('List of Pokemon to send to '
+                                    'webhooks. Specified as Pokemon ID.'))
+    webhook_list.add_argument('-wblk', '--webhook-blacklist',
+                              action='append', default=[],
+                              help=('List of Pokemon NOT to send to '
+                                    'webhooks. Specified as Pokemon ID.'))
+    webhook_list.add_argument('-wwhtf', '--webhook-whitelist-file',
+                              default='', help='File containing a list of '
+                                               'Pokemon IDs to be sent to '
+                                               'webhooks.')
+    webhook_list.add_argument('-wblkf', '--webhook-blacklist-file',
+                              default='', help='File containing a list of '
+                                               'Pokemon IDs NOT to be sent to'
+                                               'webhooks.')
     parser.add_argument('-ld', '--login-delay',
                         help='Time delay between each login attempt.',
                         type=float, default=6)
@@ -206,9 +244,8 @@ def get_args():
     parser.add_argument('-P', '--port', type=int,
                         help='Set web server listening port.', default=5000)
     parser.add_argument('-L', '--locale',
-                        help=('Locale for Pokemon names (default: {}, check ' +
-                              '{} for more).').format(config['LOCALE'],
-                                                      config['LOCALES_DIR']),
+                        help=('Locale for Pokemon names (check' +
+                              ' static/dist/locales for more).'),
                         default='en')
     parser.add_argument('-c', '--china',
                         help='Coordinates transformer for China.',
@@ -226,13 +263,15 @@ def get_args():
                         help=('Server-Only Mode. Starts only the Webserver ' +
                               'without the searcher.'),
                         action='store_true', default=False)
-    parser.add_argument('-nsc', '--no-search-control',
-                        help='Disables search control.',
-                        action='store_false', dest='search_control',
+    parser.add_argument('-sc', '--search-control',
+                        help='Enables search control.',
+                        action='store_true', dest='search_control',
+                        default=False)
+    parser.add_argument('-nfl', '--no-fixed-location',
+                        help='Disables a fixed map location and shows the ' +
+                        'search bar for use in shared maps.',
+                        action='store_false', dest='fixed_location',
                         default=True)
-    parser.add_argument('-fl', '--fixed-location',
-                        help='Hides the search bar for use in shared maps.',
-                        action='store_true', default=False)
     parser.add_argument('-k', '--gmaps-key',
                         help='Google Maps Javascript API Key.',
                         required=True)
@@ -243,8 +282,6 @@ def get_args():
                         action='store_true', default=False)
     parser.add_argument('-C', '--cors', help='Enable CORS on web server.',
                         action='store_true', default=False)
-    parser.add_argument('-D', '--db', help='Database filename for SQLite.',
-                        default='pogom.db')
     parser.add_argument('-cd', '--clear-db',
                         help=('Deletes the existing database before ' +
                               'starting the Webserver.'),
@@ -257,6 +294,10 @@ def get_args():
                         help=('Disables Gyms from the map (including ' +
                               'parsing them into local db).'),
                         action='store_true', default=False)
+    parser.add_argument('-nr', '--no-raids',
+                        help=('Disables Raids from the map (including ' +
+                              'parsing them into local db).'),
+                        action='store_true', default=False)
     parser.add_argument('-nk', '--no-pokestops',
                         help=('Disables PokeStops from the map (including ' +
                               'parsing them into local db).'),
@@ -265,36 +306,54 @@ def get_args():
                         help=('Use spawnpoint scanning (instead of hex ' +
                               'grid). Scans in a circle based on step_limit ' +
                               'when on DB.'),
-                        nargs='?', const='nofile', default=False)
+                        action='store_true', default=False)
+    parser.add_argument('-ssct', '--ss-cluster-time',
+                        help=('Time threshold in seconds for spawn point ' +
+                              'clustering (0 to disable).'),
+                        type=int, default=0)
     parser.add_argument('-speed', '--speed-scan',
                         help=('Use speed scanning to identify spawn points ' +
                               'and then scan closest spawns.'),
                         action='store_true', default=False)
+    parser.add_argument('-spin', '--pokestop-spinning',
+                        help=('Spin Pokestops with 50%% probability.'),
+                        action='store_true', default=False)
+    parser.add_argument('-ams', '--account-max-spins',
+                        help='Maximum number of Pokestop spins per hour.',
+                        type=int, default=20)
     parser.add_argument('-kph', '--kph',
                         help=('Set a maximum speed in km/hour for scanner ' +
-                              'movement.'),
+                              'movement. Default: 35, 0 to disable.'),
                         type=int, default=35)
+    parser.add_argument('-hkph', '--hlvl-kph',
+                        help=('Set a maximum speed in km/hour for scanner ' +
+                              'movement, for high-level (L30) accounts. ' +
+                              'Default: 25, 0 to disable.'),
+                        type=int, default=25)
     parser.add_argument('-ldur', '--lure-duration',
                         help=('Change duration for lures set on pokestops. ' +
                               'This is useful for events that extend lure ' +
                               'duration.'), type=int, default=30)
-    parser.add_argument('--dump-spawnpoints',
-                        help=('Dump the spawnpoints from the db to json ' +
-                              '(only for use with -ss).'),
-                        action='store_true', default=False)
-    parser.add_argument('-pd', '--purge-data',
-                        help=('Clear Pokemon from database this many hours ' +
-                              'after they disappear (0 to disable).'),
-                        type=int, default=0)
     parser.add_argument('-px', '--proxy',
                         help='Proxy url (e.g. socks5://127.0.0.1:9050)',
                         action='append')
     parser.add_argument('-pxsc', '--proxy-skip-check',
                         help='Disable checking of proxies before start.',
                         action='store_true', default=False)
-    parser.add_argument('-pxt', '--proxy-timeout',
+    parser.add_argument('-pxt', '--proxy-test-timeout',
                         help='Timeout settings for proxy checker in seconds.',
                         type=int, default=5)
+    parser.add_argument('-pxre', '--proxy-test-retries',
+                        help=('Number of times to retry sending proxy ' +
+                              'test requests on failure.'),
+                        type=int, default=0)
+    parser.add_argument('-pxbf', '--proxy-test-backoff-factor',
+                        help=('Factor (in seconds) by which the delay ' +
+                              'until next retry will increase.'),
+                        type=float, default=0.25)
+    parser.add_argument('-pxc', '--proxy-test-concurrency',
+                        help=('Async requests pool size.'), type=int,
+                        default=0)
     parser.add_argument('-pxd', '--proxy-display',
                         help=('Display info on which proxy being used ' +
                               '(index or full). To be used with -ps.'),
@@ -310,35 +369,75 @@ def get_args():
     parser.add_argument('-pxo', '--proxy-rotation',
                         help=('Enable proxy rotation with account changing ' +
                               'for search threads (none/round/random).'),
-                        type=str, default='none')
-    parser.add_argument('--db-type',
-                        help='Type of database to be used (default: sqlite).',
-                        default='sqlite')
-    parser.add_argument('--db-name', help='Name of the database to be used.')
-    parser.add_argument('--db-user', help='Username for the database.')
-    parser.add_argument('--db-pass', help='Password for the database.')
-    parser.add_argument('--db-host', help='IP or hostname for the database.')
-    parser.add_argument(
+                        type=str, default='round')
+    group = parser.add_argument_group('Database')
+    group.add_argument(
+        '--db-name', help='Name of the database to be used.', required=True)
+    group.add_argument(
+        '--db-user', help='Username for the database.', required=True)
+    group.add_argument(
+        '--db-pass', help='Password for the database.', required=True)
+    group.add_argument(
+        '--db-host',
+        help='IP or hostname for the database.',
+        default='127.0.0.1')
+    group.add_argument(
         '--db-port', help='Port for the database.', type=int, default=3306)
-    parser.add_argument('--db-max_connections',
-                        help='Max connections (per thread) for the database.',
-                        type=int, default=5)
-    parser.add_argument('--db-threads',
-                        help=('Number of db threads; increase if the db ' +
-                              'queue falls behind.'),
-                        type=int, default=1)
-    parser.add_argument('-wh', '--webhook',
-                        help='Define URL(s) to POST webhook information to.',
-                        default=None, dest='webhooks', action='append')
+    group.add_argument(
+        '--db-threads',
+        help=('Number of db threads; increase if the db ' +
+              'queue falls behind.'),
+        type=int,
+        default=1)
+    group = parser.add_argument_group('Database Cleanup')
+    group.add_argument('-DC', '--db-cleanup',
+                       help='Enable regular database cleanup thread.',
+                       action='store_true', default=False)
+    group.add_argument('-DCw', '--db-cleanup-worker',
+                       help=('Clear worker status from database after X ' +
+                             'minutes of inactivity. ' +
+                             'Default: 30, 0 to disable.'),
+                       type=int, default=30)
+    group.add_argument('-DCp', '--db-cleanup-pokemon',
+                       help=('Clear pokemon from database X hours ' +
+                             'after they disappeared. ' +
+                             'Default: 0, 0 to disable.'),
+                       type=int, default=0)
+    group.add_argument('-DCg', '--db-cleanup-gym',
+                       help=('Clear gym details from database X hours ' +
+                             'after last gym scan. ' +
+                             'Default: 8, 0 to disable.'),
+                       type=int, default=8)
+    group.add_argument('-DCs', '--db-cleanup-spawnpoint',
+                       help=('Clear spawnpoint from database X hours ' +
+                             'after last valid scan. ' +
+                             'Default: 720, 0 to disable.'),
+                       type=int, default=720)
+    group.add_argument('-DCf', '--db-cleanup-forts',
+                       help=('Clear gyms and pokestops from database X hours '
+                             'after last valid scan. '
+                             'Default: 0, 0 to disable.'),
+                       type=int, default=0)
+    parser.add_argument(
+        '-wh',
+        '--webhook',
+        help='Define URL(s) to POST webhook information to.',
+        default=None,
+        dest='webhooks',
+        action='append')
     parser.add_argument('-gi', '--gym-info',
                         help=('Get all details about gyms (causes an ' +
                               'additional API hit for every gym).'),
                         action='store_true', default=False)
-    parser.add_argument('--disable-clean', help='Disable clean db loop.',
-                        action='store_true', default=False)
-    parser.add_argument('--webhook-updates-only',
-                        help='Only send updates (Pokemon & lured pokestops).',
-                        action='store_true', default=False)
+    parser.add_argument(
+        '--wh-types',
+        help=('Defines the type of messages to send to webhooks.'),
+        choices=[
+            'pokemon', 'gym', 'raid', 'egg', 'tth', 'gym-info',
+            'pokestop', 'lure', 'captcha'
+        ],
+        action='append',
+        default=[])
     parser.add_argument('--wh-threads',
                         help=('Number of webhook threads; increase if the ' +
                               'webhook queue falls behind.'),
@@ -350,8 +449,13 @@ def get_args():
                         help=('Number of times to retry sending webhook ' +
                               'data on failure.'),
                         type=int, default=3)
-    parser.add_argument('-wht', '--wh-timeout',
-                        help='Timeout (in seconds) for webhook requests.',
+    parser.add_argument('-whct', '--wh-connect-timeout',
+                        help=('Connect timeout (in seconds) for webhook' +
+                              ' requests.'),
+                        type=float, default=1.0)
+    parser.add_argument('-whrt', '--wh-read-timeout',
+                        help=('Read timeout (in seconds) for webhook' +
+                              'requests.'),
                         type=float, default=1.0)
     parser.add_argument('-whbf', '--wh-backoff-factor',
                         help=('Factor (in seconds) by which the delay ' +
@@ -359,11 +463,11 @@ def get_args():
                         type=float, default=0.25)
     parser.add_argument('-whlfu', '--wh-lfu-size',
                         help='Webhook LFU cache max size.', type=int,
-                        default=1000)
-    parser.add_argument('-whsu', '--webhook-scheduler-updates',
-                        help=('Send webhook updates with scheduler status ' +
-                              '(use with -wh).'),
-                        action='store_true', default=True)
+                        default=2500)
+    parser.add_argument('-whfi', '--wh-frame-interval',
+                        help=('Minimum time (in ms) to wait before sending the'
+                              + ' next webhook data frame.'), type=int,
+                        default=500)
     parser.add_argument('--ssl-certificate',
                         help='Path to SSL certificate file.')
     parser.add_argument('--ssl-privatekey',
@@ -378,17 +482,20 @@ def get_args():
     parser.add_argument('-slt', '--stats-log-timer',
                         help='In log view, list per hr stats every X seconds',
                         type=int, default=0)
-    parser.add_argument('-sn', '--status-name', default=None,
+    parser.add_argument('-sn', '--status-name', default=str(os.getpid()),
                         help=('Enable status page database update using ' +
                               'STATUS_NAME as main worker name.'))
-    parser.add_argument('-spp', '--status-page-password', default=None,
-                        help='Set the status page password.')
     parser.add_argument('-hk', '--hash-key', default=None, action='append',
-                        help='Key for hash server')
-    parser.add_argument('-tut', '--complete-tutorial', action='store_true',
-                        help=("Complete ToS and tutorial steps on accounts " +
-                              "if they haven't already."),
-                        default=False)
+                        help='Key for hash server.')
+    parser.add_argument('-hs', '--hash-service', default='bossland', type=str,
+                        help=('Hash service name. Supports bossland and'
+                              ' devkat hashing.'),
+                        choices=['bossland', 'devkat'])
+    parser.add_argument('--hash-header-sleep',
+                        help=('Use the BossLand headers to determine how long'
+                              ' a worker should sleep if it exceeds the'
+                              ' hashing quota. Default: False.'),
+                        action='store_true', default=False)
     parser.add_argument('-novc', '--no-version-check', action='store_true',
                         help='Disable API version check.',
                         default=False)
@@ -396,9 +503,6 @@ def get_args():
                         help='Interval to check API version in seconds ' +
                         '(Default: in [60, 300]).',
                         default=random.randint(60, 300))
-    parser.add_argument('-el', '--encrypt-lib',
-                        help=('Path to encrypt lib to be used instead of ' +
-                              'the shipped ones.'))
     parser.add_argument('-odt', '--on-demand_timeout',
                         help=('Pause searching while web UI is inactive ' +
                               'for this timeout (in seconds).'),
@@ -406,22 +510,72 @@ def get_args():
     parser.add_argument('--disable-blacklist',
                         help=('Disable the global anti-scraper IP blacklist.'),
                         action='store_true', default=False)
-    verbosity = parser.add_mutually_exclusive_group()
-    verbosity.add_argument('-v', '--verbose',
-                           help=('Show debug messages from RocketMap ' +
-                                 'and pgoapi. Optionally specify file ' +
-                                 'to log to.'),
-                           nargs='?', const='nofile', default=False,
-                           metavar='filename.log')
-    verbosity.add_argument('-vv', '--very-verbose',
-                           help=('Like verbose, but show debug messages ' +
-                                 'from all modules as well.  Optionally ' +
-                                 'specify file to log to.'),
-                           nargs='?', const='nofile', default=False,
-                           metavar='filename.log')
+    parser.add_argument('-tp', '--trusted-proxies', default=[],
+                        action='append',
+                        help=('Enables the use of X-FORWARDED-FOR headers ' +
+                              'to identify the IP of clients connecting ' +
+                              'through these trusted proxies.'))
+    parser.add_argument('--api-version', default='0.91.2',
+                        help=('API version currently in use.'))
+    parser.add_argument('--no-file-logs',
+                        help=('Disable logging to files. ' +
+                              'Does not disable --access-logs.'),
+                        action='store_true', default=False)
+    parser.add_argument('--log-path',
+                        help=('Defines directory to save log files to.'),
+                        default='logs/')
+    parser.add_argument('--log-filename',
+                        help=('Defines the log filename to be saved.'
+                              ' Allows date formatting, and replaces <SN>'
+                              " with the instance's status name. Read the"
+                              ' python time module docs for details.'
+                              ' Default: %%Y%%m%%d_%%H%%M_<SN>.log.'),
+                        default='%Y%m%d_%H%M_<SN>.log'),
+    parser.add_argument('--dump',
+                        help=('Dump censored debug info about the ' +
+                              'environment and auto-upload to ' +
+                              'hastebin.com.'),
+                        action='store_true', default=False)
+    parser.add_argument('-exg', '--ex-gyms',
+                        help=('Fetch OSM parks within geofence and flag ' +
+                              'gyms that are candidates for EX raids. ' +
+                              'Only required once per area.'),
+                        action='store_true', default=False)
+    verbose = parser.add_mutually_exclusive_group()
+    verbose.add_argument('-v',
+                         help=('Show debug messages from RocketMap ' +
+                               'and pgoapi. Can be repeated up to 3 times.'),
+                         action='count', default=0, dest='verbose')
+    verbose.add_argument('--verbosity',
+                         help=('Show debug messages from RocketMap ' +
+                               'and pgoapi.'),
+                         type=int, dest='verbose')
+    rarity = parser.add_argument_group('Dynamic Rarity')
+    rarity.add_argument('-Rh', '--rarity-hours',
+                        help=('Number of hours of Pokemon data to use ' +
+                              'to calculate dynamic rarity. Decimals ' +
+                              'allowed. Default: 48, 0 to use all data.'),
+                        type=float, default=48)
+    rarity.add_argument('-Rf', '--rarity-update-frequency',
+                        help=('How often (in minutes) the dynamic rarity ' +
+                              'should be updated. Decimals allowed. ' +
+                              'Default: 0, 0 to disable.'),
+                        type=float, default=0)
+    statusp = parser.add_argument_group('Status Page')
+    statusp.add_argument('-SPp', '--status-page-password', default=None,
+                         help='Set the status page password.')
+    statusp.add_argument('-SPf', '--status-page-filter',
+                         help=('Filter worker status that are inactive for ' +
+                               'X minutes. Default: 30, 0 to disable.'),
+                         type=int, default=30)
     parser.set_defaults(DEBUG=False)
 
     args = parser.parse_args()
+
+    # Allow status name and date formatting in log filename.
+    args.log_filename = strftime(args.log_filename)
+    args.log_filename = args.log_filename.replace('<sn>', '<SN>')
+    args.log_filename = args.log_filename.replace('<SN>', args.status_name)
 
     if args.only_server:
         if args.location is None:
@@ -453,7 +607,8 @@ def get_args():
                     csv_input.append('<username>,<password>')
                     csv_input.append('<ptc/google>,<username>,<password>')
 
-                    # If the number of fields is differend this is not a CSV.
+                    # If the number of fields is different,
+                    # then this is not a CSV.
                     if num_fields != line.count(',') + 1:
                         print(sys.argv[0] +
                               ": Error parsing CSV file on line " + str(num) +
@@ -501,7 +656,7 @@ def get_args():
 
                     # If the number of fields is three then assume this is
                     # "ptc,username,password". As requested.
-                    if num_fields == 3:
+                    if num_fields >= 3:
                         # If field 0 is not ptc or google something is wrong!
                         if (fields[0].lower() == 'ptc' or
                                 fields[0].lower() == 'google'):
@@ -522,12 +677,6 @@ def get_args():
                             args.password.append(fields[2])
                         else:
                             field_error = 'password'
-
-                    if num_fields > 3:
-                        print(('Too many fields in accounts file: max ' +
-                               'supported are 3 fields. ' +
-                               'Found {} fields').format(num_fields))
-                        sys.exit(1)
 
                     # If something is wrong display error.
                     if field_error != '':
@@ -608,6 +757,47 @@ def get_args():
                                   'password': args.password[i],
                                   'auth_service': args.auth_service[i]})
 
+        # Prepare the L30 accounts for the account sets.
+        args.accounts_L30 = []
+
+        if args.high_lvl_accounts:
+            # Context processor.
+            with open(args.high_lvl_accounts, 'r') as accs:
+                for line in accs:
+                    # Make sure it's not an empty line.
+                    if not line.strip():
+                        continue
+
+                    line = line.split(',')
+
+                    # We need "service, username, password".
+                    if len(line) < 3:
+                        raise Exception('L30 account is missing a'
+                                        + ' field. Each line requires: '
+                                        + '"service,user,pass".')
+
+                    # Let's remove trailing whitespace.
+                    service = line[0].strip()
+                    username = line[1].strip()
+                    password = line[2].strip()
+
+                    hlvl_account = {
+                        'auth_service': service,
+                        'username': username,
+                        'password': password,
+                        'captcha': False
+                    }
+
+                    args.accounts_L30.append(hlvl_account)
+
+        # Prepare the IV/CP scanning filters.
+        args.enc_whitelist = []
+
+        # IV/CP scanning.
+        if args.enc_whitelist_file:
+            with open(args.enc_whitelist_file) as f:
+                args.enc_whitelist = frozenset([int(l.strip()) for l in f])
+
         # Make max workers equal number of accounts if unspecified, and disable
         # account switching.
         if args.workers is None:
@@ -626,19 +816,25 @@ def get_args():
                   "--accountcsv to add accounts.")
             sys.exit(1)
 
-        if args.encounter_whitelist_file:
-            with open(args.encounter_whitelist_file) as f:
-                args.encounter_whitelist = [get_pokemon_id(name) for name in
-                                            f.read().splitlines()]
-        elif args.encounter_blacklist_file:
-            with open(args.encounter_blacklist_file) as f:
-                args.encounter_blacklist = [get_pokemon_id(name) for name in
-                                            f.read().splitlines()]
+        if args.webhook_whitelist_file:
+            with open(args.webhook_whitelist_file) as f:
+                args.webhook_whitelist = frozenset(
+                    [int(p_id.strip()) for p_id in f])
+        elif args.webhook_blacklist_file:
+            with open(args.webhook_blacklist_file) as f:
+                args.webhook_blacklist = frozenset(
+                    [int(p_id.strip()) for p_id in f])
         else:
-            args.encounter_blacklist = [int(i) for i in
-                                        args.encounter_blacklist]
-            args.encounter_whitelist = [int(i) for i in
-                                        args.encounter_whitelist]
+            args.webhook_blacklist = frozenset(
+                [int(i) for i in args.webhook_blacklist])
+            args.webhook_whitelist = frozenset(
+                [int(i) for i in args.webhook_whitelist])
+
+        # create an empty set
+        args.ignorelist = []
+        if args.ignorelist_file:
+            with open(args.ignorelist_file) as f:
+                args.ignorelist = frozenset([int(l.strip()) for l in f])
 
         # Decide which scanning mode to use.
         if args.spawnpoint_scanning:
@@ -652,7 +848,24 @@ def get_args():
 
         # Disable webhook scheduler updates if webhooks are disabled
         if args.webhooks is None:
-            args.webhook_scheduler_updates = False
+            args.wh_types = frozenset()
+        else:
+            args.wh_types = frozenset([i for i in args.wh_types])
+
+    args.locales_dir = 'static/dist/locales'
+    args.data_dir = 'static/dist/data'
+
+    # Set hashing endpoint. 'bossland' doesn't need to be added here, it's
+    # the default in the API.
+    legal_endpoints = {
+        'devkat': 'https://hashing.devkat.org'
+    }
+
+    hash_service = args.hash_service.lower()
+    endpoint = legal_endpoints.get(hash_service, False)
+    if endpoint:
+        log.info('Using hash service: %s.', hash_service)
+        HashServer.endpoint = endpoint
 
     return args
 
@@ -679,61 +892,86 @@ def clock_between(start, test, end):
             (not (end <= test <= start) and start > end))
 
 
-# Return amount of seconds between two times on the clock.
-def secs_between(time1, time2):
-    return min((time1 - time2) % 3600, (time2 - time1) % 3600)
-
-
 # Return the s2sphere cellid token from a location.
 def cellid(loc):
-    return CellId.from_lat_lng(LatLng.from_degrees(loc[0], loc[1])).to_token()
+    return int(
+        CellId.from_lat_lng(LatLng.from_degrees(loc[0], loc[1])).to_token(),
+        16)
 
 
-# Return equirectangular approximation distance in km.
-def equi_rect_distance(loc1, loc2):
-    R = 6371  # Radius of the earth in km.
-    lat1 = math.radians(loc1[0])
-    lat2 = math.radians(loc2[0])
-    x = (math.radians(loc2[1]) - math.radians(loc1[1])
-         ) * math.cos(0.5 * (lat2 + lat1))
-    y = lat2 - lat1
-    return R * math.sqrt(x * x + y * y)
+# Return approximate distance in meters.
+def distance(pos1, pos2):
+    return haversine((tuple(pos1))[0:2], (tuple(pos2))[0:2])
 
 
-# Return True if distance between two locs is less than distance in km.
-def in_radius(loc1, loc2, distance):
-    return equi_rect_distance(loc1, loc2) < distance
+# Return True if distance between two locs is less than distance in meters.
+def in_radius(loc1, loc2, radius):
+    return distance(loc1, loc2) < radius
 
 
 def i8ln(word):
-    if config['LOCALE'] == "en":
-        return word
     if not hasattr(i8ln, 'dictionary'):
+        args = get_args()
         file_path = os.path.join(
-            config['ROOT_PATH'],
-            config['LOCALES_DIR'],
-            '{}.min.json'.format(config['LOCALE']))
+            args.root_path,
+            args.locales_dir,
+            '{}.min.json'.format(args.locale))
         if os.path.isfile(file_path):
             with open(file_path, 'r') as f:
                 i8ln.dictionary = json.loads(f.read())
         else:
-            log.warning(
-                'Skipping translations - unable to find locale file: %s',
-                file_path)
-            return word
+            # If locale file is not found we set an empty dict to avoid
+            # checking the file every time, we skip the warning for English as
+            # it is not expected to exist.
+            if not args.locale == 'en':
+                log.warning(
+                    'Skipping translations - unable to find locale file: %s',
+                    file_path)
+            i8ln.dictionary = {}
     if word in i8ln.dictionary:
         return i8ln.dictionary[word]
     else:
-        log.debug('Unable to find translation for "%s" in locale %s!',
-                  word, config['LOCALE'])
         return word
+
+
+# Thread function for periodical enc list updating.
+def dynamic_loading_refresher(file_list):
+    # We're on a 60-second timer.
+    refresh_time_sec = 60
+
+    while True:
+        # Wait (x-1) seconds before refresh, min. 1s.
+        time.sleep(max(1, refresh_time_sec - 1))
+
+        for arg_type, filename in file_list.items():
+            try:
+                # IV/CP scanning.
+                if filename:
+                    # Only refresh if the file has changed.
+                    current_time_sec = time.time()
+                    file_modified_time_sec = os.path.getmtime(filename)
+                    time_diff_sec = current_time_sec - file_modified_time_sec
+
+                    # File has changed in the last refresh_time_sec seconds.
+                    if time_diff_sec < refresh_time_sec:
+                        args = get_args()
+                        with open(filename) as f:
+                            new_list = frozenset([int(l.strip()) for l in f])
+                            setattr(args, arg_type, new_list)
+                            log.info('New %s is: %s.', arg_type, new_list)
+                    else:
+                        log.debug('No change found in %s.', filename)
+            except Exception as e:
+                log.exception('Exception occurred while' +
+                              ' updating %s: %s.', arg_type, e)
 
 
 def get_pokemon_data(pokemon_id):
     if not hasattr(get_pokemon_data, 'pokemon'):
+        args = get_args()
         file_path = os.path.join(
-            config['ROOT_PATH'],
-            config['DATA_DIR'],
+            args.root_path,
+            args.data_dir,
             'pokemon.min.json')
 
         with open(file_path, 'r') as f:
@@ -741,25 +979,8 @@ def get_pokemon_data(pokemon_id):
     return get_pokemon_data.pokemon[str(pokemon_id)]
 
 
-def get_pokemon_id(pokemon_name):
-    if not hasattr(get_pokemon_id, 'ids'):
-        if not hasattr(get_pokemon_data, 'pokemon'):
-            # initialize from file
-            get_pokemon_data(1)
-
-        get_pokemon_id.ids = {}
-        for pokemon_id, data in get_pokemon_data.pokemon.iteritems():
-            get_pokemon_id.ids[data['name']] = int(pokemon_id)
-
-    return get_pokemon_id.ids.get(pokemon_name, -1)
-
-
 def get_pokemon_name(pokemon_id):
     return i8ln(get_pokemon_data(pokemon_id)['name'])
-
-
-def get_pokemon_rarity(pokemon_id):
-    return i8ln(get_pokemon_data(pokemon_id)['rarity'])
 
 
 def get_pokemon_types(pokemon_id):
@@ -770,9 +991,10 @@ def get_pokemon_types(pokemon_id):
 
 def get_moves_data(move_id):
     if not hasattr(get_moves_data, 'moves'):
+        args = get_args()
         file_path = os.path.join(
-            config['ROOT_PATH'],
-            config['DATA_DIR'],
+            args.root_path,
+            args.data_dir,
             'moves.min.json')
 
         with open(file_path, 'r') as f:
@@ -794,49 +1016,16 @@ def get_move_energy(move_id):
 
 def get_move_type(move_id):
     move_type = get_moves_data(move_id)['type']
-    return {"type": i8ln(move_type), "type_en": move_type}
-
-
-class Timer():
-
-    def __init__(self, name):
-        self.times = [(name, time.time(), 0)]
-
-    def add(self, step):
-        t = time.time()
-        self.times.append((step, t, round((t - self.times[-1][1]) * 1000)))
-
-    def checkpoint(self, step):
-        t = time.time()
-        self.times.append(('total @ ' + step, t, t - self.times[0][1]))
-
-    def output(self):
-        self.checkpoint('end')
-        pprint.pprint(self.times)
+    return {'type': i8ln(move_type), 'type_en': move_type}
 
 
 def dottedQuadToNum(ip):
     return struct.unpack("!L", socket.inet_aton(ip))[0]
 
 
-def get_blacklist():
-    try:
-        url = 'https://blist.devkat.org/blacklist.json'
-        blacklist = requests.get(url).json()
-        log.debug('Entries in blacklist: %s.', len(blacklist))
-        return blacklist
-    except (requests.exceptions.RequestException, IndexError, KeyError):
-        log.error('Unable to retrieve blacklist, setting to empty.')
-        return []
-
-
 # Generate random device info.
 # Original by Noctem.
-IPHONES = {'iPhone5,1': 'N41AP',
-           'iPhone5,2': 'N42AP',
-           'iPhone5,3': 'N48AP',
-           'iPhone5,4': 'N49AP',
-           'iPhone6,1': 'N51AP',
+IPHONES = {'iPhone6,1': 'N51AP',
            'iPhone6,2': 'N53AP',
            'iPhone7,1': 'N56AP',
            'iPhone7,2': 'N61AP',
@@ -846,39 +1035,453 @@ IPHONES = {'iPhone5,1': 'N41AP',
            'iPhone9,1': 'D10AP',
            'iPhone9,2': 'D11AP',
            'iPhone9,3': 'D101AP',
-           'iPhone9,4': 'D111AP'}
+           'iPhone9,4': 'D111AP',
+           'iPhone10,1': 'D20AP',
+           'iPhone10,2': 'D21AP',
+           'iPhone10,3': 'D22AP',
+           'iPhone10,4': 'D201AP',
+           'iPhone10,5': 'D211AP',
+           'iPhone10,6': 'D221AP'}
 
 
-def generate_device_info():
+def generate_device_info(identifier):
+    md5 = hashlib.md5()
+    md5.update(identifier)
+    pick_hash = int(md5.hexdigest(), 16)
+
     device_info = {'device_brand': 'Apple', 'device_model': 'iPhone',
                    'hardware_manufacturer': 'Apple',
                    'firmware_brand': 'iPhone OS'}
     devices = tuple(IPHONES.keys())
 
-    ios8 = ('8.0', '8.0.1', '8.0.2', '8.1', '8.1.1',
-            '8.1.2', '8.1.3', '8.2', '8.3', '8.4', '8.4.1')
-    ios9 = ('9.0', '9.0.1', '9.0.2', '9.1', '9.2', '9.2.1',
-            '9.3', '9.3.1', '9.3.2', '9.3.3', '9.3.4', '9.3.5')
-    ios10 = ('10.0', '10.0.1', '10.0.2', '10.0.3', '10.1', '10.1.1')
+    ios9 = ('9.0', '9.0.1', '9.0.2', '9.1', '9.2', '9.2.1', '9.3', '9.3.1',
+            '9.3.2', '9.3.3', '9.3.4', '9.3.5')
+    # 10.0 was only for iPhone 7 and 7 Plus, and is rare.
+    ios10 = ('10.0.1', '10.0.2', '10.0.3', '10.1', '10.1.1', '10.2', '10.2.1',
+             '10.3', '10.3.1', '10.3.2', '10.3.3')
+    ios11 = ('11.0.1', '11.0.2', '11.0.3', '11.1', '11.1.1', '11.1.2')
 
-    device_info['device_model_boot'] = random.choice(devices)
-    device_info['hardware_model'] = IPHONES[device_info['device_model_boot']]
-    device_info['device_id'] = uuid4().hex
+    device_pick = devices[pick_hash % len(devices)]
+    device_info['device_model_boot'] = device_pick
+    device_info['hardware_model'] = IPHONES[device_pick]
+    device_info['device_id'] = md5.hexdigest()
 
-    if device_info['hardware_model'] in ('iPhone9,1', 'iPhone9,2',
-                                         'iPhone9,3', 'iPhone9,4'):
-        device_info['firmware_type'] = random.choice(ios10)
-    elif device_info['hardware_model'] in ('iPhone8,1', 'iPhone8,2',
-                                           'iPhone8,4'):
-        device_info['firmware_type'] = random.choice(ios9 + ios10)
+    if device_pick in ('iPhone10,1', 'iPhone10,2', 'iPhone10,3',
+                       'iPhone10,4', 'iPhone10,5', 'iPhone10,6'):
+        # iPhone 8/8+ and X started on 11.
+        ios_pool = ios11
+    elif device_pick in ('iPhone9,1', 'iPhone9,2', 'iPhone9,3', 'iPhone9,4'):
+        # iPhone 7/7+ started on 10.
+        ios_pool = ios10 + ios11
+    elif device_pick == 'iPhone8,4':
+        # iPhone SE started on 9.3.
+        ios_pool = ('9.3', '9.3.1', '9.3.2', '9.3.3', '9.3.4', '9.3.5') \
+                   + ios10 + ios11
     else:
-        device_info['firmware_type'] = random.choice(ios8 + ios9 + ios10)
+        ios_pool = ios9 + ios10 + ios11
 
+    device_info['firmware_type'] = ios_pool[pick_hash % len(ios_pool)]
     return device_info
 
 
-def extract_sprites():
-    log.debug("Extracting sprites...")
-    zip = zipfile.ZipFile('static01.zip', 'r')
-    zip.extractall('static')
-    zip.close()
+def calc_pokemon_level(cp_multiplier):
+    if cp_multiplier < 0.734:
+        pokemon_level = (58.35178527 * cp_multiplier * cp_multiplier -
+                         2.838007664 * cp_multiplier + 0.8539209906)
+    else:
+        pokemon_level = 171.0112688 * cp_multiplier - 95.20425243
+    pokemon_level = int((round(pokemon_level) * 2) / 2)
+    return pokemon_level
+
+
+@memoize
+def gmaps_reverse_geolocate(gmaps_key, locale, location):
+    # Find the reverse geolocation
+    geolocator = GoogleV3(api_key=gmaps_key)
+
+    player_locale = {
+        'country': 'US',
+        'language': locale,
+        'timezone': 'America/Denver'
+    }
+
+    try:
+        reverse = geolocator.reverse(location)
+        address = reverse[-1].raw['address_components']
+        country_code = 'US'
+
+        # Find country component.
+        for component in address:
+            # Look for country.
+            component_is_country = any([t == 'country'
+                                        for t in component.get('types', [])])
+
+            if component_is_country:
+                country_code = component['short_name']
+                break
+
+        try:
+            timezone = geolocator.timezone(location)
+            player_locale.update({
+                'country': country_code,
+                'timezone': str(timezone)
+            })
+        except Exception as e:
+            log.exception('Exception on Google Timezone API. '
+                          + 'Please check that you have Google Timezone API'
+                          + ' enabled for your API key'
+                          + ' (https://developers.google.com/maps/'
+                          + 'documentation/timezone/intro): %s.', e)
+    except Exception as e:
+        log.exception('Exception while obtaining player locale: %s.'
+                      + ' Using default locale.', e)
+
+    return player_locale
+
+
+# Get a future_requests FuturesSession that supports asynchronous workers
+# and retrying requests on failure.
+# Setting up a persistent session that is re-used by multiple requests can
+# speed up requests to the same host, as it'll re-use the underlying TCP
+# connection.
+def get_async_requests_session(num_retries, backoff_factor, pool_size,
+                               status_forcelist=None):
+    # Use requests & urllib3 to auto-retry.
+    # If the backoff_factor is 0.1, then sleep() will sleep for [0.1s, 0.2s,
+    # 0.4s, ...] between retries. It will also force a retry if the status
+    # code returned is in status_forcelist.
+    if status_forcelist is None:
+        status_forcelist = [500, 502, 503, 504]
+    session = FuturesSession(max_workers=pool_size)
+
+    # If any regular response is generated, no retry is done. Without using
+    # the status_forcelist, even a response with status 500 will not be
+    # retried.
+    retries = Retry(total=num_retries, backoff_factor=backoff_factor,
+                    status_forcelist=status_forcelist)
+
+    # Mount handler on both HTTP & HTTPS.
+    session.mount('http://', HTTPAdapter(max_retries=retries,
+                                         pool_connections=pool_size,
+                                         pool_maxsize=pool_size))
+    session.mount('https://', HTTPAdapter(max_retries=retries,
+                                          pool_connections=pool_size,
+                                          pool_maxsize=pool_size))
+
+    return session
+
+
+# Get common usage stats.
+def resource_usage():
+    platform = sys.platform
+    proc = psutil.Process()
+
+    with proc.oneshot():
+        cpu_usage = psutil.cpu_times_percent()
+        mem_usage = psutil.virtual_memory()
+        net_usage = psutil.net_io_counters()
+
+        usage = {
+            'platform': platform,
+            'PID': proc.pid,
+            'MEM': {
+                'total': mem_usage.total,
+                'available': mem_usage.available,
+                'used': mem_usage.used,
+                'free': mem_usage.free,
+                'percent_used': mem_usage.percent,
+                'process_percent_used': proc.memory_percent()
+            },
+            'CPU': {
+                'user': cpu_usage.user,
+                'system': cpu_usage.system,
+                'idle': cpu_usage.idle,
+                'process_percent_used': proc.cpu_percent(interval=1)
+            },
+            'NET': {
+                'bytes_sent': net_usage.bytes_sent,
+                'bytes_recv': net_usage.bytes_recv,
+                'packets_sent': net_usage.packets_sent,
+                'packets_recv': net_usage.packets_recv,
+                'errin': net_usage.errin,
+                'errout': net_usage.errout,
+                'dropin': net_usage.dropin,
+                'dropout': net_usage.dropout
+            },
+            'connections': {
+                'ipv4': len(proc.connections('inet4')),
+                'ipv6': len(proc.connections('inet6'))
+            },
+            'thread_count': proc.num_threads(),
+            'process_count': len(psutil.pids())
+        }
+
+        # Linux only.
+        if platform == 'linux' or platform == 'linux2':
+            usage['sensors'] = {
+                'temperatures': psutil.sensors_temperatures(),
+                'fans': psutil.sensors_fans()
+            }
+            usage['connections']['unix'] = len(proc.connections('unix'))
+            usage['num_handles'] = proc.num_fds()
+        elif platform == 'win32':
+            usage['num_handles'] = proc.num_handles()
+
+    return usage
+
+
+# Log resource usage to any logger.
+def log_resource_usage(log_method):
+    usage = resource_usage()
+    log_method('Resource usage: %s.', usage)
+
+
+# Generic method to support periodic background tasks. Thread sleep could be
+# replaced by a tiny sleep, and time measuring, but we're using sleep() for
+# now to keep resource overhead to an absolute minimum.
+def periodic_loop(f, loop_delay_ms):
+    while True:
+        # Do the thing.
+        f()
+        # zZz :bed:
+        time.sleep(loop_delay_ms / 1000)
+
+
+# Periodically log resource usage every 'loop_delay_ms' ms.
+def log_resource_usage_loop(loop_delay_ms=60000):
+    # Helper method to log to specific log level.
+    def log_resource_usage_to_debug():
+        log_resource_usage(log.debug)
+
+    periodic_loop(log_resource_usage_to_debug, loop_delay_ms)
+
+
+# Return shell call output as string, replacing any errors with the
+# error's string representation.
+def check_output_catch(command):
+    try:
+        result = subprocess.check_output(command,
+                                         stderr=subprocess.STDOUT,
+                                         shell=True)
+    except Exception as ex:
+        result = 'ERROR: ' + ex.output.replace(os.linesep, ' ')
+    finally:
+        return result.strip()
+
+
+# Automatically censor all necessary fields. Lists will return their
+# length, all other items will return 'empty_tag' if they're empty
+# or 'censored_tag' if not.
+def _censor_args_namespace(args, censored_tag, empty_tag):
+    fields_to_censor = [
+        'accounts',
+        'accounts_L30',
+        'username',
+        'password',
+        'auth_service',
+        'proxy',
+        'webhooks',
+        'webhook_blacklist',
+        'webhook_whitelist',
+        'config',
+        'accountcsv',
+        'high_lvl_accounts',
+        'geofence_file',
+        'geofence_excluded_file',
+        'ignorelist_file',
+        'enc_whitelist_file',
+        'webhook_whitelist_file',
+        'webhook_blacklist_file',
+        'db',
+        'proxy_file',
+        'log_path',
+        'log_filename',
+        'encrypt_lib',
+        'ssl_certificate',
+        'ssl_privatekey',
+        'location',
+        'captcha_key',
+        'captcha_dsk',
+        'manual_captcha_domain',
+        'host',
+        'port',
+        'gmaps_key',
+        'db_name',
+        'db_user',
+        'db_pass',
+        'db_host',
+        'db_port',
+        'status_name',
+        'status_page_password',
+        'hash_key',
+        'trusted_proxies',
+        'data_dir',
+        'locales_dir',
+        'shared_config'
+    ]
+
+    for field in fields_to_censor:
+        # Do we have the field?
+        if field in args:
+            value = args[field]
+
+            # Replace with length of list or censored tag.
+            if isinstance(value, list):
+                args[field] = len(value)
+            else:
+                if args[field]:
+                    args[field] = censored_tag
+                else:
+                    args[field] = empty_tag
+
+    return args
+
+
+# Get censored debug info about the environment we're running in.
+def get_censored_debug_info():
+    CENSORED_TAG = '<censored>'
+    EMPTY_TAG = '<empty>'
+    args = _censor_args_namespace(vars(get_args()), CENSORED_TAG, EMPTY_TAG)
+
+    # Get git status.
+    status = check_output_catch('git status')
+    log = check_output_catch('git log -1')
+    remotes = check_output_catch('git remote -v')
+
+    # Python, pip, node, npm.
+    python = sys.version.replace(os.linesep, ' ').strip()
+    pip = check_output_catch('pip -V')
+    node = check_output_catch('node -v')
+    npm = check_output_catch('npm -v')
+
+    return {
+        'args': args,
+        'git': {
+            'status': status,
+            'log': log,
+            'remotes': remotes
+        },
+        'versions': {
+            'python': python,
+            'pip': pip,
+            'node': node,
+            'npm': npm
+        }
+    }
+
+
+# Post a string of text to a hasteb.in and retrieve the URL.
+def upload_to_hastebin(text):
+    log.info('Uploading info to hastebin.com...')
+    response = requests.post('https://hastebin.com/documents', data=text)
+    return response.json()['key']
+
+
+# Get censored debug info & auto-upload to hasteb.in.
+def get_debug_dump_link():
+    debug = get_censored_debug_info()
+    args = debug['args']
+    git = debug['git']
+    versions = debug['versions']
+
+    # Format debug info for text upload.
+    result = '''#######################
+### RocketMap debug ###
+#######################
+
+## Versions:
+'''
+
+    # Versions first, for readability.
+    result += '- Python: ' + versions['python'] + '\n'
+    result += '- pip: ' + versions['pip'] + '\n'
+    result += '- Node.js: ' + versions['node'] + '\n'
+    result += '- npm: ' + versions['npm'] + '\n'
+
+    # Next up is git.
+    result += '\n\n' + '## Git:' + '\n'
+    result += git['status'] + '\n'
+    result += '\n\n' + git['remotes'] + '\n'
+    result += '\n\n' + git['log'] + '\n'
+
+    # And finally, our censored args.
+    result += '\n\n' + '## Settings:' + '\n'
+    result += pformat(args, width=1)
+
+    # Upload to hasteb.in.
+    return upload_to_hastebin(result)
+
+
+def get_pokemon_rarity(total_spawns_all, total_spawns_pokemon):
+    spawn_group = 'Common'
+
+    spawn_rate_pct = total_spawns_pokemon / float(total_spawns_all)
+    spawn_rate_pct = round(100 * spawn_rate_pct, 4)
+
+    if spawn_rate_pct < 0.01:
+        spawn_group = 'Ultra Rare'
+    elif spawn_rate_pct < 0.03:
+        spawn_group = 'Very Rare'
+    elif spawn_rate_pct < 0.5:
+        spawn_group = 'Rare'
+    elif spawn_rate_pct < 1:
+        spawn_group = 'Uncommon'
+
+    return spawn_group
+
+
+def dynamic_rarity_refresher():
+    # If we import at the top, pogom.models will import pogom.utils,
+    # causing the cyclic import to make some things unavailable.
+    from pogom.models import Pokemon
+
+    # Refresh every x hours.
+    args = get_args()
+    hours = args.rarity_hours
+    root_path = args.root_path
+
+    rarities_path = os.path.join(root_path, 'static/dist/data/rarity.json')
+    update_frequency_mins = args.rarity_update_frequency
+    refresh_time_sec = update_frequency_mins * 60
+
+    while True:
+        log.info('Updating dynamic rarity...')
+
+        start = default_timer()
+        db_rarities = Pokemon.get_spawn_counts(hours)
+        total = db_rarities['total']
+        pokemon = db_rarities['pokemon']
+
+        # Store as an easy lookup table for front-end.
+        rarities = {}
+
+        for poke in pokemon:
+            rarities[poke['pokemon_id']] = get_pokemon_rarity(total,
+                                                              poke['count'])
+
+        # Save to file.
+        with open(rarities_path, 'w') as outfile:
+            json.dump(rarities, outfile)
+
+        duration = default_timer() - start
+        log.info('Updated dynamic rarity. It took %.2fs for %d entries.',
+                 duration,
+                 total)
+
+        # Wait x seconds before next refresh.
+        log.debug('Waiting %d minutes before next dynamic rarity update.',
+                  refresh_time_sec / 60)
+        time.sleep(refresh_time_sec)
+
+
+# Translate peewee model class attribute to database column name.
+def peewee_attr_to_col(cls, field):
+    field_column = getattr(cls, field)
+
+    # Only try to do it on populated fields.
+    if field_column is not None:
+        field_column = field_column.db_column
+    else:
+        field_column = field
+
+    return field_column

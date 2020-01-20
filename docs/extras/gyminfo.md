@@ -1,4 +1,4 @@
-# Detailed Gym Information
+# Detailed Gym Data
 ![Sample Image](../_static/img/gyminfo.png)
 
 To collect all of the available information about gyms, you can enable gym info parsing.
@@ -25,8 +25,12 @@ python runserver.py -gi
 Or update your config.ini:
 
 ```
-gym-info:true            # enables detailed gym info collection (default false)
+gym-info			# enables detailed gym info collection (default false)
 ```
+
+## Displaying the gym details sidebar in the front-end
+
+To show the gym details sidebar on the front-end, ``-gi`` needs to be enabled on your webserver instance. To scan gyms for the gym details, ``-gi`` must also be enabled on your scanner instances.
 
 ## New Webhook
 
@@ -56,8 +60,6 @@ When gym info parsing is enabled, gym details will be sent to webhooks. A sample
 			"stamina": 46,
 			"pokemon_uid": 9278614152997308833,
 			"iv_attack": 12,
-			"trainer_name": "SportyGator",
-			"trainer_level": 18,
 			"cp": 138,
 			"iv_stamina": 8
 		}, {
@@ -74,8 +76,6 @@ When gym info parsing is enabled, gym details will be sent to webhooks. A sample
 			"stamina": 250,
 			"pokemon_uid": 6103380929145641793,
 			"iv_attack": 5,
-			"trainer_name": "Meckelangelo",
-			"trainer_level": 22,
 			"cp": 1353,
 			"iv_stamina": 15
 		}, {
@@ -92,8 +92,6 @@ When gym info parsing is enabled, gym details will be sent to webhooks. A sample
 			"stamina": 252,
 			"pokemon_uid": 3580711458547635980,
 			"iv_attack": 10,
-			"trainer_name": "Plaidflamingo",
-			"trainer_level": 23,
 			"cp": 1670,
 			"iv_stamina": 11
 		}]

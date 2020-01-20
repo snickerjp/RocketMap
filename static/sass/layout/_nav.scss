@@ -20,7 +20,7 @@
     z-index: 500;
     h3 {
       font-size: 18px;
-      font-family: 'Muli', sans-serif;
+      font-family: 'Open Sans', sans-serif;
       color: darken(_palette(accent2, bg), 12);
     }
     p {
@@ -129,5 +129,13 @@
     }
     .ui-state-focus {
       outline: none;
+    }
+
+    .fa {
+      font-weight: 700;
+    }
+
+    .fa-fw {
+      margin: 0px 5px 0px 0px;
     }
   }
